@@ -585,6 +585,14 @@ with st.container(border=True):
                 chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
 
+                # Dynamic fallback loader: if real data is empty, fall back to simulated chain with clear toast
+                if chain.empty:
+                    st.toast("⚠️ Breeze API returned empty chain for this contract date. Gracefully loading un-cached high-fidelity simulated Option Chain.", icon="💡")
+                    chain, times = demo_chain(atm, step, strike_count, selected_day)
+                    st.session_state["breeze_fallback_active"] = True
+                else:
+                    st.session_state["breeze_fallback_active"] = False
+
         st.session_state.chain = chain
         st.session_state.times = times
 
@@ -597,6 +605,10 @@ with st.container(border=True):
 chain=st.session_state.get("chain",pd.DataFrame()); times=st.session_state.get("times",[])
 if chain.empty:
     st.info("Choose a date/time and expiry, then click Load / Generate Chain."); st.stop()
+
+# Display dynamic fallback badge if active to explain the state clearly
+if st.session_state.get("breeze_fallback_active", False):
+    st.info("💡 **Replay Engine Status**: Real ICICI Securities historical options database was empty for this specific date/expiry. Un-cached simulated Option Chain loaded so you can continuously trade and replay.")
 
 # Let's ensure times is not a DatetimeIndex but a plain list/sequence to avoid truth value ambiguity
 if hasattr(times, "tolist"):

@@ -12,6 +12,9 @@ def format_breeze_date(date_obj, target_type):
     - DISPLAY_FORMAT: "DD-b-YYYY"
     """
     if isinstance(date_obj, str):
+        if "T" in date_obj and date_obj.endswith("Z"):
+            # Already a fully formatted ISO UTC string! Return exactly as-is!
+            return date_obj
         try:
             if "T" in date_obj:
                 date_obj = datetime.strptime(date_obj.split("T")[0], "%Y-%m-%d").date()
