@@ -76,6 +76,26 @@ def move_index(times, idx, delta):
     if not times: return idx
     return max(0,min(len(times)-1,idx+delta))
 
+def get_expiry_dates(selected_day, symbol):
+    # standard NSE expiry weekdays:
+    # FINNIFTY: Tuesday (weekday=1)
+    # BANKNIFTY: Wednesday (weekday=2)
+    # NIFTY/others: Thursday (weekday=3)
+    if symbol == "FINNIFTY":
+        target_wd = 1
+    elif symbol == "BANKNIFTY":
+        target_wd = 2
+    else:
+        target_wd = 3
+    current_wd = selected_day.weekday()
+    days_to_expiry = (target_wd - current_wd) % 7
+    anchor_date = selected_day + timedelta(days=days_to_expiry)
+    expiries = []
+    for week_offset in range(-15, 16):
+        exp_date = anchor_date + timedelta(weeks=week_offset)
+        expiries.append(exp_date)
+    return sorted(list(set(expiries)))
+
 import uuid
 
 def current_quotes(view):
@@ -323,8 +343,17 @@ with st.container(border=True):
     m1, m2, m3, m4, m5, m6 = st.columns([1.2, 1.2, 1.4, 1.2, 1.0, 1.0])
     atm = m1.number_input("ATM strike", 1000.0, step=50.0, value=25000.0)
     strike_count = m2.slider("Strikes", 4, 20, 20)
-    # Expiry is intentionally a separate control; Breeze mode can later be wired to expiry discovery.
-    expiry_date = m3.date_input("Option expiry", date(2026, 8, 13))
+
+    # Expiry is a selectbox dynamically calculated as 15 back and 15 forward from replay date
+    expiry_options = get_expiry_dates(selected_day, symbol)
+    # Default to the first expiry that is on or after selected_day
+    default_expiry_index = 0
+    for idx_exp, exp in enumerate(expiry_options):
+        if exp >= selected_day:
+            default_expiry_index = idx_exp
+            break
+
+    expiry_date = m3.selectbox("Option expiry", options=expiry_options, index=default_expiry_index, format_func=lambda d: d.strftime("%d-%b-%Y"))
     expiry_time = m4.time_input("Expiry time", time(15, 30))
     rate = m5.number_input("Risk-free %", 6.5, step=.25) / 100
     div = m6.number_input("Dividend %", 0.0, step=.25) / 100
