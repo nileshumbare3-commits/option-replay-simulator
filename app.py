@@ -475,79 +475,28 @@ with st.sidebar:
     else:
         st.info("Demo mode works without credentials. Enter API credentials above to connect Breeze.")
 
-   # ==============================================================================
-# 🚀 AUTOMATED SESSION TOKEN INTERCEPTOR & EXCHANGE
-# ==============================================================================
-# 1. Inspect URL Query Parameters automatically on page load/redirect
-query_params = st.query_params
-
-# Detect common session token parameter keys returned by Breeze/ICICI Direct
-session_keys = ["api_session", "API_Session", "apisession", "session_token", "token"]
-detected_raw_token = None
-
-for key in session_keys:
-    if key in query_params:
-        detected_raw_token = query_params[key]
-        break
-
-# 2. Perform automated token exchange if a new parameter is detected
-if detected_raw_token and not st.session_state.get("session_token"):
+    # Manual Session Token/Exchange
     if client.configured:
-        try:
-            with st.spinner("⚡ Auto-authenticating: Exchanging Breeze session token..."):
-                # Clean token string if full URL or query parameters were passed
-                token_to_exchange = detected_raw_token
-                if "api_session=" in token_to_exchange:
-                    token_to_exchange = token_to_exchange.split("api_session=")[1].split("&")[0]
-
-                # Exchange session token with ICICI Direct Breeze API
-                session_token = client.exchange_api_session(token_to_exchange)
-                st.session_state["session_token"] = session_token
-                st.toast("✅ Breeze session authenticated successfully!", icon="🎉")
-
-            # Clear query parameters from URL to prevent infinite reload loops
-            st.query_params.clear()
-            st.rerun()
-        except Exception as ex:
-            st.error(f"Automated Session Exchange failed: {ex}")
-    else:
-        st.warning("Breeze API Keys not configured. Unable to exchange session token.")
-
-# 3. Fallback UI in Sidebar (Shows status & manual override option if needed)
-with st.sidebar:
-    if st.session_state.get("session_token"):
-        st.success("● Connected to Breeze")
-        trunc_token = (
-            st.session_state["session_token"][:8] + "..."
-            if len(st.session_state["session_token"]) > 10
-            else st.session_state["session_token"]
-        )
-        st.caption(f"Session Token: {trunc_token}")
-        if st.button("🚪 Disconnect Breeze", use_container_width=True):
-            st.session_state["session_token"] = None
-            st.rerun()
-    else:
-        # Optional manual paste fallback inside an expander
-        with st.expander("🛠️ Manual Token Exchange (Fallback)"):
-            manual_session = st.text_input("Paste Redirect URL / api_session", placeholder="https://localhost:8501/?api_session=...")
-            if st.button("🔌 Manual Exchange", use_container_width=True):
-                if manual_session:
-                    token_to_exchange = manual_session
-                    if "api_session=" in manual_session:
-                        try:
-                            token_to_exchange = manual_session.split("api_session=")[1].split("&")[0]
-                        except Exception:
-                            pass
+        manual_session = st.text_input("Manual API Session / Redirect URL", placeholder="Paste api_session or redirected URL")
+        if st.button("🔌 Exchange Session Token", use_container_width=True):
+            if manual_session:
+                token_to_exchange = manual_session
+                if "api_session=" in manual_session:
                     try:
-                        with st.spinner("Exchanging manual token..."):
-                            session_token = client.exchange_api_session(token_to_exchange)
-                            st.session_state["session_token"] = session_token
-                        st.success("Session exchanged successfully!")
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(f"Exchange failed: {ex}")
-                else:
-                    st.warning("Please enter a token or URL first.")
+                        token_to_exchange = manual_session.split("api_session=")[1].split("&")[0]
+                    except Exception:
+                        pass
+                try:
+                    with st.spinner("Exchanging manual token..."):
+                        session_token = client.exchange_api_session(token_to_exchange)
+                        st.session_state["session_token"] = session_token
+                    st.success("Session exchanged successfully!")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Exchange failed: {ex}")
+            else:
+                st.warning("Please enter a token or URL first.")
+
     # Connection Status
     if st.session_state.get("session_token"):
         st.success("● Connected to Breeze")
@@ -606,24 +555,40 @@ with st.container(border=True):
                 st.error("Connect Breeze first.")
                 chain, times = pd.DataFrame(), []
             else:
-                start_iso = format_breeze_date(selected_day, "ISO_HISTORICAL")
-                end_iso = format_breeze_date(selected_day, "ISO_HISTORICAL")
-                exp_iso = format_breeze_date(expiry_date, "ISO_EXPIRY")
+                # Breeze API Strict ISO Date Formatting with Trading Hours
+                start_iso = f"{selected_day.strftime('%Y-%m-%d')}T09:15:00.000Z"
+                end_iso = f"{selected_day.strftime('%Y-%m-%d')}T15:30:00.000Z"
+                exp_iso = f"{expiry_date.strftime('%Y-%m-%d')}T07:00:00.000Z"
+
                 for k in strikes:
                     for right in ["call", "put"]:
                         try:
-                            d0 = get_hist(client.api_key, client.secret_key, session, symbol, start_iso, end_iso, exp_iso, right, k, interval)
+                            d0 = get_hist(
+                                client.api_key,
+                                client.secret_key,
+                                session,
+                                symbol,
+                                start_iso,
+                                end_iso,
+                                exp_iso,
+                                right,
+                                k,
+                                interval
+                            )
                             if not d0.empty:
                                 d0["strike"] = k
                                 d0["right"] = right
                                 frames.append(d0)
                         except Exception as ex:
                             st.warning(f"{right.upper()} {k}: {ex}")
+
                 chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
+
         st.session_state.chain = chain
         st.session_state.times = times
-        # select nearest available timestamp to requested time
+
+        # Select nearest available timestamp to requested time
         target = pd.Timestamp(datetime.combine(selected_day, selected_time))
         if len(times) > 0:
             st.session_state.idx = int(np.argmin([abs(pd.Timestamp(x) - target) for x in times]))
