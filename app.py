@@ -220,6 +220,38 @@ st.markdown("""
 st.title("📈 Breeze Option Replay")
 st.caption("Historical paper-trading simulator • every paper fill is replay-time stamped • no live orders")
 
+# 1. API Keys configuration from environment variables, .env, or fallback .env.example
+api_key_env, secret_key_env = load_env_credentials()
+
+if "breeze_api_key" not in st.session_state or not st.session_state.breeze_api_key:
+    st.session_state.breeze_api_key = api_key_env
+if "breeze_secret_key" not in st.session_state or not st.session_state.breeze_secret_key:
+    st.session_state.breeze_secret_key = secret_key_env
+
+# Create BreezeClient instance
+client = BreezeClient(
+    api_key=st.session_state.breeze_api_key,
+    secret_key=st.session_state.breeze_secret_key,
+    session_token=st.session_state.get("session_token")
+)
+
+# ---------- auto-connect & token exchange ----------
+# Capture any common parameter names returned by redirect URL: "api_session", "apisession", "API_Session", "session_token", "token"
+api_session = None
+for param_name in ["API_Session", "api_session", "apisession", "session_token", "token"]:
+    if param_name in st.query_params:
+        api_session = st.query_params[param_name]
+        break
+
+if api_session and client.configured:
+    try:
+        with st.spinner("Exchanging redirected session token..."):
+            st.session_state["session_token"] = client.exchange_api_session(api_session)
+        st.query_params.clear()
+        st.rerun()
+    except Exception as ex:
+        st.error(f"Auto-exchange failed: {ex}")
+
 # ---------- controls ----------
 with st.container(border=True):
     a,b,c,d,e,f=st.columns([1.1,1.0,1.35,1.15,1.2,1.1])
@@ -236,14 +268,6 @@ if "autoplay" not in st.session_state:
 if "autoplay_speed" not in st.session_state:
     st.session_state.autoplay_speed = 1.0
 
-# 1. API Keys configuration from environment variables, .env, or fallback .env.example
-api_key_env, secret_key_env = load_env_credentials()
-
-if "breeze_api_key" not in st.session_state or not st.session_state.breeze_api_key:
-    st.session_state.breeze_api_key = api_key_env
-if "breeze_secret_key" not in st.session_state or not st.session_state.breeze_secret_key:
-    st.session_state.breeze_secret_key = secret_key_env
-
 with st.sidebar:
     st.header("🔐 Connection")
 
@@ -255,34 +279,10 @@ with st.sidebar:
             st.session_state.breeze_secret_key = user_secret_key
             st.rerun()
 
-    # Create BreezeClient instance
-    client = BreezeClient(
-        api_key=st.session_state.breeze_api_key,
-        secret_key=st.session_state.breeze_secret_key,
-        session_token=st.session_state.get("session_token")
-    )
-
     if client.configured:
         st.link_button("🌐 Connect/Login ICICI Direct", client.login_url(), use_container_width=True)
     else:
         st.info("Demo mode works without credentials. Enter API credentials above to connect Breeze.")
-
-    # Auto-exchange from query parameters
-    # Capture any common parameter names returned by redirect URL: "api_session", "apisession", "API_Session", "session_token", "token"
-    api_session = None
-    for param_name in ["API_Session", "api_session", "apisession", "session_token", "token"]:
-        if param_name in st.query_params:
-            api_session = st.query_params[param_name]
-            break
-
-    if api_session and client.configured:
-        try:
-            with st.spinner("Exchanging redirected session token..."):
-                st.session_state["session_token"] = client.exchange_api_session(api_session)
-            st.query_params.clear()
-            st.rerun()
-        except Exception as ex:
-            st.error(f"Auto-exchange failed: {ex}")
 
     # Manual Session Token/Exchange
     if client.configured:
@@ -317,36 +317,51 @@ with st.sidebar:
     else:
         st.warning("● Demo / Paper Mode Active")
 
-    st.header("📅 Market setup")
-    atm=st.number_input("ATM strike",1000.0,step=50.0,value=25000.0)
-    strike_count=st.slider("Strikes",4,20,20)
+# ---------- market parameters & load chain ----------
+with st.container(border=True):
+    st.markdown("#### 📅 Market Setup & Option Parameters")
+    m1, m2, m3, m4, m5, m6 = st.columns([1.2, 1.2, 1.4, 1.2, 1.0, 1.0])
+    atm = m1.number_input("ATM strike", 1000.0, step=50.0, value=25000.0)
+    strike_count = m2.slider("Strikes", 4, 20, 20)
     # Expiry is intentionally a separate control; Breeze mode can later be wired to expiry discovery.
-    expiry_date=st.date_input("Option expiry",date(2026,8,13))
-    expiry_time=st.time_input("Expiry time",time(15,30))
-    rate=st.number_input("Risk-free %",6.5,step=.25)/100
-    div=st.number_input("Dividend %",0.0,step=.25)/100
-    if st.button("🔄 Load / Generate Chain",type="primary",use_container_width=True):
-        if mode=="Demo":
-            chain,times=demo_chain(atm,step,strike_count,selected_day)
+    expiry_date = m3.date_input("Option expiry", date(2026, 8, 13))
+    expiry_time = m4.time_input("Expiry time", time(15, 30))
+    rate = m5.number_input("Risk-free %", 6.5, step=.25) / 100
+    div = m6.number_input("Dividend %", 0.0, step=.25) / 100
+
+    if st.button("🔄 Load / Generate Chain", type="primary", use_container_width=True):
+        if mode == "Demo":
+            chain, times = demo_chain(atm, step, strike_count, selected_day)
         else:
-            session=st.session_state.get("session_token")
-            frames=[]; strikes=sorted(round(atm+(i-strike_count//2)*step,2) for i in range(strike_count))
-            if not session: st.error("Connect Breeze first."); chain,times=pd.DataFrame(),[]
+            session = st.session_state.get("session_token")
+            frames = []
+            strikes = sorted(round(atm + (i - strike_count // 2) * step, 2) for i in range(strike_count))
+            if not session:
+                st.error("Connect Breeze first.")
+                chain, times = pd.DataFrame(), []
             else:
-                start_iso=f"{selected_day}T09:15:00.000Z"; end_iso=f"{selected_day}T15:30:00.000Z"; exp_iso=f"{expiry_date}T{expiry_time.strftime('%H:%M:%S')}.000Z"
+                start_iso = f"{selected_day}T09:15:00.000Z"
+                end_iso = f"{selected_day}T15:30:00.000Z"
+                exp_iso = f"{expiry_date}T{expiry_time.strftime('%H:%M:%S')}.000Z"
                 for k in strikes:
-                    for right in ["call","put"]:
+                    for right in ["call", "put"]:
                         try:
-                            d0=get_hist(client.api_key,client.secret_key,session,symbol,start_iso,end_iso,exp_iso,right,k,interval)
-                            if not d0.empty: d0["strike"]=k; d0["right"]=right; frames.append(d0)
-                        except Exception as ex: st.warning(f"{right.upper()} {k}: {ex}")
-                chain=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame(); times=sorted(chain.datetime.dropna().unique()) if not chain.empty else []
-        st.session_state.chain=chain; st.session_state.times=times
+                            d0 = get_hist(client.api_key, client.secret_key, session, symbol, start_iso, end_iso, exp_iso, right, k, interval)
+                            if not d0.empty:
+                                d0["strike"] = k
+                                d0["right"] = right
+                                frames.append(d0)
+                        except Exception as ex:
+                            st.warning(f"{right.upper()} {k}: {ex}")
+                chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
+        st.session_state.chain = chain
+        st.session_state.times = times
         # select nearest available timestamp to requested time
-        target=pd.Timestamp(datetime.combine(selected_day,selected_time))
+        target = pd.Timestamp(datetime.combine(selected_day, selected_time))
         if len(times) > 0:
-            st.session_state.idx=int(np.argmin([abs(pd.Timestamp(x)-target) for x in times]))
-        st.session_state.mtm_history=[]
+            st.session_state.idx = int(np.argmin([abs(pd.Timestamp(x) - target) for x in times]))
+        st.session_state.mtm_history = []
 
 chain=st.session_state.get("chain",pd.DataFrame()); times=st.session_state.get("times",[])
 if chain.empty:
