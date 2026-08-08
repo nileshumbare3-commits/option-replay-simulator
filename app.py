@@ -38,6 +38,11 @@ def load_env_credentials():
     return api_key, secret_key
 
 # ---------- helpers ----------
+def is_real_session_token(token):
+    if not token or len(token) < 10 or token.startswith("exchanged_") or "mock" in token.lower() or "session" in token.lower():
+        return False
+    return True
+
 def norm(rows):
     df = pd.DataFrame(rows)
     if df.empty or "datetime" not in df or "close" not in df: return pd.DataFrame()
@@ -90,7 +95,8 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
         return base_spot + day_variance
     else:
         session = st.session_state.get("session_token")
-        if not session:
+        if not is_real_session_token(session):
+            # Skip REST call if not authenticated or session token is placeholder/mock
             return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
         try:
             start_iso = f"{selected_day}T09:15:00.000Z"
@@ -106,7 +112,8 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
                 best_row = df.loc[df["diff"].idxmin()]
                 return float(best_row["close"])
         except Exception as e:
-            st.warning(f"Failed to fetch auto-spot price from Breeze: {e}. Using fallback.")
+            # Output silently to terminal logs instead of rendering yellow st.warning banner in the UI
+            print(f"Failed to fetch auto-spot price from Breeze: {e}. Using fallback.")
         return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
 
 def get_strike_position_info(strike, right):
