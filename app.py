@@ -49,6 +49,11 @@ def get_hist(api_key, secret_key, session, symbol, start, end, expiry, right, st
     c = BreezeClient(api_key=api_key, secret_key=secret_key, session_token=session)
     return norm(c.historical_option(symbol, start, end, expiry, right, strike, interval))
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_index_hist(api_key, secret_key, session, symbol, start, end, interval):
+    c = BreezeClient(api_key=api_key, secret_key=secret_key, session_token=session)
+    return norm(c.historical_index(symbol, start, end, interval))
+
 def demo_chain(atm, step, count, day):
     rng=np.random.default_rng(7)
     times=pd.date_range(f"{day} 09:15", f"{day} 15:30", freq="5min")
@@ -91,10 +96,40 @@ def get_expiry_dates(selected_day, symbol):
     days_to_expiry = (target_wd - current_wd) % 7
     anchor_date = selected_day + timedelta(days=days_to_expiry)
     expiries = []
-    for week_offset in range(-15, 16):
+    # Display 15 weekly expiries starting from the current week (offset 0) up to 15 weeks in the future.
+    for week_offset in range(0, 16):
         exp_date = anchor_date + timedelta(weeks=week_offset)
         expiries.append(exp_date)
     return sorted(list(set(expiries)))
+
+def get_spot_price(client, symbol, selected_day, selected_time, mode):
+    if mode == "Demo":
+        base_spot = 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
+        day_variance = (selected_day.day * 15.0) - 200.0
+        return base_spot + day_variance
+    else:
+        session = st.session_state.get("session_token")
+        if not session:
+            return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
+        try:
+            start_iso = f"{selected_day}T09:15:00.000Z"
+            end_iso = f"{selected_day}T15:30:00.000Z"
+            # we fetch index candles for the chosen day
+            df = get_index_hist(client.api_key, client.secret_key, session, symbol, start_iso, end_iso, "1minute")
+            if not df.empty and "close" in df and "datetime" in df:
+                df["datetime"] = pd.to_datetime(df["datetime"])
+                # Localize/strip tz for exact matching
+                target_dt = pd.Timestamp(datetime.combine(selected_day, selected_time))
+                if target_dt.tzinfo is not None:
+                    target_dt = target_dt.tz_localize(None)
+                # Strip timezone from index df as well to avoid timezone offset matching issues
+                df["datetime_naive"] = df["datetime"].dt.tz_localize(None) if df["datetime"].dt.tz is not None else df["datetime"]
+                df["diff"] = (df["datetime_naive"] - target_dt).abs()
+                best_row = df.loc[df["diff"].idxmin()]
+                return float(best_row["close"])
+        except Exception as e:
+            st.warning(f"Failed to fetch auto-spot price from Breeze: {e}. Using fallback.")
+        return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
 
 import uuid
 
@@ -337,23 +372,32 @@ with st.sidebar:
     else:
         st.warning("● Demo / Paper Mode Active")
 
+# ---------- auto-calculate spot price ----------
+current_params_key = f"{symbol}_{mode}_{selected_day}_{selected_time}"
+if st.session_state.get("last_params_key") != current_params_key:
+    # Trigger auto spot update
+    auto_spot = get_spot_price(client, symbol, selected_day, selected_time, mode)
+    st.session_state["atm_strike_val"] = auto_spot
+    st.session_state["last_params_key"] = current_params_key
+
+if "atm_strike_val" not in st.session_state:
+    st.session_state["atm_strike_val"] = 25000.0
+
 # ---------- market parameters & load chain ----------
 with st.container(border=True):
     st.markdown("#### 📅 Market Setup & Option Parameters")
     m1, m2, m3, m4, m5, m6 = st.columns([1.2, 1.2, 1.4, 1.2, 1.0, 1.0])
-    atm = m1.number_input("ATM strike", 1000.0, step=50.0, value=25000.0)
+
+    atm = m1.number_input("ATM strike", 1000.0, step=50.0, value=float(st.session_state["atm_strike_val"]))
+    # Save manually updated values back to state so users can override
+    st.session_state["atm_strike_val"] = atm
+
     strike_count = m2.slider("Strikes", 4, 20, 20)
 
-    # Expiry is a selectbox dynamically calculated as 15 back and 15 forward from replay date
+    # Expiry is a selectbox dynamically calculated as 0 to 15 weeks forward from replay date
     expiry_options = get_expiry_dates(selected_day, symbol)
-    # Default to the first expiry that is on or after selected_day
-    default_expiry_index = 0
-    for idx_exp, exp in enumerate(expiry_options):
-        if exp >= selected_day:
-            default_expiry_index = idx_exp
-            break
+    expiry_date = m3.selectbox("Option expiry", options=expiry_options, index=0, format_func=lambda d: d.strftime("%d-%b-%Y"))
 
-    expiry_date = m3.selectbox("Option expiry", options=expiry_options, index=default_expiry_index, format_func=lambda d: d.strftime("%d-%b-%Y"))
     expiry_time = m4.time_input("Expiry time", time(15, 30))
     rate = m5.number_input("Risk-free %", 6.5, step=.25) / 100
     div = m6.number_input("Dividend %", 0.0, step=.25) / 100
