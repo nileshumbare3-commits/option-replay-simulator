@@ -6,7 +6,7 @@ import streamlit as st
 import calendar
 from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
-from breeze_client import BreezeClient
+from breeze_client import BreezeClient, format_breeze_date
 from greeks import implied_vol, greeks
 
 load_dotenv()
@@ -117,16 +117,12 @@ def get_real_expiry_date_for_week(d, symbol):
     monday = d - timedelta(days=d.weekday())
 
     if symbol == "NIFTY":
-        # All expire on Thursdays
         thursday = monday + timedelta(days=3)
         return shift_to_valid_trading_day(thursday)
     elif symbol == "FINNIFTY":
-        # All expire on Tuesdays
         tuesday = monday + timedelta(days=1)
         return shift_to_valid_trading_day(tuesday)
     elif symbol == "BANKNIFTY":
-        # Weekly: Wednesday (Monday + 2 days)
-        # Monthly: Last Thursday of the month
         wednesday = monday + timedelta(days=2)
         last_thu = get_last_thursday_of_month(wednesday.year, wednesday.month)
 
@@ -136,13 +132,35 @@ def get_real_expiry_date_for_week(d, symbol):
         else:
             return shift_to_valid_trading_day(wednesday)
     else:
-        # Default Thursday
         thursday = monday + timedelta(days=3)
         return shift_to_valid_trading_day(thursday)
 
-def get_expiry_dates(selected_day, symbol):
+def get_expiry_dates(selected_day, symbol, client=None):
+    """
+    Expiry Selection with dynamic Broker Security Master sync and fallback.
+    - Exposes exactly up to 20 past and 20 future expiries dynamically.
+    """
+    if client and client.configured and st.session_state.get("session_token"):
+        try:
+            quotes = client.get_option_chain_quotes(symbol)
+            if quotes:
+                real_expiries = set()
+                for q in quotes:
+                    exp_str = q.get("expiry_date")
+                    if exp_str:
+                        # Parse ISO date safely
+                        d = datetime.strptime(exp_str.split("T")[0], "%Y-%m-%d").date()
+                        real_expiries.add(d)
+                if real_expiries:
+                    sorted_real = sorted(list(real_expiries))
+                    past = [d for d in sorted_real if d < selected_day][-20:]
+                    active_future = [d for d in sorted_real if d >= selected_day][:21]
+                    return sorted(past + active_future)
+        except Exception:
+            pass
+
+    # Dynamic weekday-shifted calendar fallback
     expiries = []
-    # Dynamic selection across exactly 20 back and 20 forward weekly expiries
     for week_offset in range(-20, 21):
         target_day_in_week = selected_day + timedelta(weeks=week_offset)
         adjusted_expiry = get_real_expiry_date_for_week(target_day_in_week, symbol)
@@ -596,10 +614,10 @@ with st.container(border=True):
     strike_count = m2.slider("Strikes", 4, 20, 20)
 
     # Expiry is a selectbox dynamically calculated as 20 back / 20 forward weekly expiries
-    expiry_options = get_expiry_dates(selected_day, symbol)
+    expiry_options = get_expiry_dates(selected_day, symbol, client)
 
     # Find active expiry (closest on or after selected_day)
-    default_expiry_index = 20
+    default_expiry_index = 0
     for idx_exp, exp in enumerate(expiry_options):
         if exp >= selected_day:
             default_expiry_index = idx_exp
@@ -621,9 +639,9 @@ with st.container(border=True):
                 st.error("Connect Breeze first.")
                 chain, times = pd.DataFrame(), []
             else:
-                start_iso = f"{selected_day}T09:15:00.000Z"
-                end_iso = f"{selected_day}T15:30:00.000Z"
-                exp_iso = f"{expiry_date}T{expiry_time.strftime('%H:%M:%S')}.000Z"
+                start_iso = format_breeze_date(selected_day, "ISO_HISTORICAL")
+                end_iso = format_breeze_date(selected_day, "ISO_HISTORICAL")
+                exp_iso = format_breeze_date(expiry_date, "ISO_EXPIRY")
                 for k in strikes:
                     for right in ["call", "put"]:
                         try:
