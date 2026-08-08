@@ -72,8 +72,8 @@ def demo_chain(atm, step, count, day):
 def payoff(legs, spots):
     total=np.zeros_like(spots,dtype=float)
     for leg in legs:
-        intrinsic=np.maximum(spots-leg["strike"],0) if leg["right"]=="CALL" else np.maximum(leg["strike"]-spots,0)
-        per=intrinsic-leg["premium"] if leg["side"]=="BUY" else leg["premium"]-intrinsic
+        intrinsic=np.maximum(spots-leg["strike"],0) if leg["right"].upper()=="CALL" else np.maximum(leg["strike"]-spots,0)
+        per=intrinsic-leg["premium"] if leg["side"].upper()=="BUY" else leg["premium"]-intrinsic
         total += leg["qty"]*per
     return total
 
@@ -81,25 +81,47 @@ def move_index(times, idx, delta):
     if not times: return idx
     return max(0,min(len(times)-1,idx+delta))
 
+# NSE Indian trading holidays (representative list for simulation)
+TRADING_HOLIDAYS = {
+    (1, 26),   # Republic Day
+    (5, 1),    # May Day
+    (8, 15),   # Independence Day
+    (10, 2),   # Gandhi Jayanti
+    (10, 24),  # Dussehra
+    (11, 14),  # Diwali
+    (12, 25),  # Christmas
+}
+
+def is_trading_holiday(d: date) -> bool:
+    if d.weekday() >= 5: # Saturday or Sunday
+        return True
+    if (d.month, d.day) in TRADING_HOLIDAYS:
+        return True
+    return False
+
+def shift_to_valid_trading_day(d: date) -> date:
+    while is_trading_holiday(d):
+        d = d - timedelta(days=1)
+    return d
+
 def get_expiry_dates(selected_day, symbol):
-    # standard NSE expiry weekdays:
-    # FINNIFTY: Tuesday (weekday=1)
-    # BANKNIFTY: Wednesday (weekday=2)
-    # NIFTY/others: Thursday (weekday=3)
     if symbol == "FINNIFTY":
-        target_wd = 1
+        target_wd = 1  # Tuesday
     elif symbol == "BANKNIFTY":
-        target_wd = 2
+        target_wd = 2  # Wednesday
     else:
-        target_wd = 3
+        target_wd = 3  # Thursday
+
     current_wd = selected_day.weekday()
     days_to_expiry = (target_wd - current_wd) % 7
     anchor_date = selected_day + timedelta(days=days_to_expiry)
+
     expiries = []
-    # Display 15 weekly expiries starting from the current week (offset 0) up to 15 weeks in the future.
-    for week_offset in range(0, 16):
-        exp_date = anchor_date + timedelta(weeks=week_offset)
-        expiries.append(exp_date)
+    # Dynamic selection across exactly 20 back and 20 forward weekly expiries
+    for week_offset in range(-20, 21):
+        raw_date = anchor_date + timedelta(weeks=week_offset)
+        adjusted_date = shift_to_valid_trading_day(raw_date)
+        expiries.append(adjusted_date)
     return sorted(list(set(expiries)))
 
 def get_spot_price(client, symbol, selected_day, selected_time, mode):
@@ -114,15 +136,12 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
         try:
             start_iso = f"{selected_day}T09:15:00.000Z"
             end_iso = f"{selected_day}T15:30:00.000Z"
-            # we fetch index candles for the chosen day
             df = get_index_hist(client.api_key, client.secret_key, session, symbol, start_iso, end_iso, "1minute")
             if not df.empty and "close" in df and "datetime" in df:
                 df["datetime"] = pd.to_datetime(df["datetime"])
-                # Localize/strip tz for exact matching
                 target_dt = pd.Timestamp(datetime.combine(selected_day, selected_time))
                 if target_dt.tzinfo is not None:
                     target_dt = target_dt.tz_localize(None)
-                # Strip timezone from index df as well to avoid timezone offset matching issues
                 df["datetime_naive"] = df["datetime"].dt.tz_localize(None) if df["datetime"].dt.tz is not None else df["datetime"]
                 df["diff"] = (df["datetime_naive"] - target_dt).abs()
                 best_row = df.loc[df["diff"].idxmin()]
@@ -132,7 +151,6 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
         return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
 
 def get_strike_position_info(strike, right):
-    # right is "CALL" or "PUT"
     active_positions = st.session_state.get("positions", [])
     net_qty = 0
     buys = 0
@@ -147,6 +165,141 @@ def get_strike_position_info(strike, right):
                 net_qty -= q
                 sells += q
     return net_qty, buys, sells
+
+def toggle_chain_trade(strike, right, side, ltp, qty, chain_sl, chain_tp, times, idx):
+    match_pos = None
+    for p in st.session_state.positions:
+        if p["strike"] == float(strike) and p["right"].upper() == right.upper() and p["side"].upper() == side.upper():
+            match_pos = p
+            break
+
+    if match_pos is not None:
+        # Deselect / remove
+        st.session_state.positions.remove(match_pos)
+        if side.upper() == "BUY":
+            st.session_state.cash += match_pos["qty"] * match_pos["avg"]
+        else:
+            st.session_state.cash -= match_pos["qty"] * match_pos["avg"]
+
+        st.session_state.trade_history.append({
+            "time": pd.Timestamp(times[idx]),
+            "action": f"TOGGLE_OFF ({side.upper()}_{right.upper()})",
+            "right": right.upper(),
+            "strike": float(strike),
+            "qty": match_pos["qty"],
+            "price": float(ltp),
+            "realized": 0.0
+        })
+    else:
+        # Select / add
+        new_pos = {
+            "id": str(uuid.uuid4()),
+            "right": right.upper(),
+            "strike": float(strike),
+            "side": side.upper(),
+            "qty": int(qty),
+            "avg": float(ltp),
+            "sl_pct": float(chain_sl) if chain_sl > 0 else None,
+            "tp_pct": float(chain_tp) if chain_tp > 0 else None,
+            "entry_time": str(pd.Timestamp(times[idx]))
+        }
+        st.session_state.positions.append(new_pos)
+        if side.upper() == "BUY":
+            st.session_state.cash -= int(qty) * float(ltp)
+        else:
+            st.session_state.cash += int(qty) * float(ltp)
+
+        st.session_state.trade_history.append({
+            "time": pd.Timestamp(times[idx]),
+            "action": f"{side.upper()} ({right.upper()})",
+            "right": right.upper(),
+            "strike": float(strike),
+            "qty": int(qty),
+            "price": float(ltp),
+            "realized": 0.0
+        })
+
+from backend.math_engine import black_scholes_pricing
+
+def draw_consolidated_payoff_chart(active_legs, spot, step, T, rate, div):
+    spots = np.linspace(max(1, spot - step * 10), spot + step * 10, 201)
+
+    # 1. Calculate Expiry P&L (T = 0)
+    expiry_pnl = np.zeros_like(spots, dtype=float)
+    for leg in active_legs:
+        intrinsic = np.maximum(spots - leg["strike"], 0) if leg["right"].upper() == "CALL" else np.maximum(leg["strike"] - spots, 0)
+        per = intrinsic - leg["premium"] if leg["side"].upper() == "BUY" else leg["premium"] - intrinsic
+        expiry_pnl += leg["qty"] * per
+
+    # 2. Calculate Today's MTM (T = T_target)
+    mtm_pnl = np.zeros_like(spots, dtype=float)
+    sigma = 0.18  # standard Indian options average IV
+    for leg in active_legs:
+        mult = 1.0 if leg["side"].upper() == "BUY" else -1.0
+        leg_prices = np.array([
+            black_scholes_pricing(s, leg["strike"], T, rate, div, sigma, leg["right"].lower())
+            for s in spots
+        ])
+        mtm_pnl += leg["qty"] * (leg_prices - leg["premium"]) * mult
+
+    # Build consolidated plot
+    fig = go.Figure()
+
+    # Shading the Profit Zone (above 0)
+    profit_shade = np.maximum(expiry_pnl, 0)
+    fig.add_trace(go.Scatter(
+        x=spots, y=profit_shade,
+        mode="lines",
+        line=dict(width=0),
+        fill="tozeroy",
+        fillcolor="rgba(34, 197, 94, 0.2)",
+        name="Profit Zone",
+        showlegend=False
+    ))
+
+    # Shading the Loss Zone (below 0)
+    loss_shade = np.minimum(expiry_pnl, 0)
+    fig.add_trace(go.Scatter(
+        x=spots, y=loss_shade,
+        mode="lines",
+        line=dict(width=0),
+        fill="tozeroy",
+        fillcolor="rgba(239, 68, 68, 0.2)",
+        name="Loss Zone",
+        showlegend=False
+    ))
+
+    # Expiry Payoff line (solid)
+    fig.add_trace(go.Scatter(
+        x=spots, y=expiry_pnl,
+        mode="lines",
+        line=dict(color="#22c55e", width=3),
+        name="Expiry Payoff (T=0)"
+    ))
+
+    # Today's MTM curve (dashed)
+    fig.add_trace(go.Scatter(
+        x=spots, y=mtm_pnl,
+        mode="lines",
+        line=dict(color="#38bdf8", width=2.5, dash="dash"),
+        name="Today's MTM (T+t)"
+    ))
+
+    fig.add_vline(x=spot, line_dash="dot", line_color="#f97316", width=2, annotation_text="Spot", annotation_position="top left")
+    fig.add_hline(y=0, line_dash="solid", line_color="#475569", width=1)
+
+    fig.update_layout(
+        title="Consolidated Strategy Payoff & Today's MTM Chart (StockMock Style)",
+        xaxis_title="Underlying Spot Price (₹)",
+        yaxis_title="Profit / Loss (₹)",
+        height=450,
+        hovermode="x unified",
+        template="plotly_dark",
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig
 
 import uuid
 
@@ -284,9 +437,16 @@ if "autoplay" not in st.session_state:
 if "autoplay_speed" not in st.session_state:
     st.session_state.autoplay_speed = 1.0
 
+# STREAMLIT INTERACTIVE STYLE OVERLAYS
 st.markdown("""
 <style>
 .block-container{padding-top:1rem;max-width:1750px}.small{color:#8b949e;font-size:.85rem}
+div.stButton > button:first-child {
+    transition: all 0.2s ease-in-out;
+}
+div.stButton > button:first-child:hover {
+    transform: scale(1.05);
+}
 </style>
 """,unsafe_allow_html=True)
 st.title("📈 Breeze Option Replay")
@@ -406,15 +566,21 @@ with st.container(border=True):
     m1, m2, m3, m4, m5, m6 = st.columns([1.2, 1.2, 1.4, 1.2, 1.0, 1.0])
 
     atm = m1.number_input("ATM strike", 1000.0, step=50.0, value=float(st.session_state["atm_strike_val"]))
-    # Save manually updated values back to state so users can override
     st.session_state["atm_strike_val"] = atm
 
     strike_count = m2.slider("Strikes", 4, 20, 20)
 
-    # Expiry is a selectbox dynamically calculated as 0 to 15 weeks forward from replay date
+    # Expiry is a selectbox dynamically calculated as 20 back / 20 forward weekly expiries
     expiry_options = get_expiry_dates(selected_day, symbol)
-    expiry_date = m3.selectbox("Option expiry", options=expiry_options, index=0, format_func=lambda d: d.strftime("%d-%b-%Y"))
 
+    # Find active expiry (closest on or after selected_day)
+    default_expiry_index = 20
+    for idx_exp, exp in enumerate(expiry_options):
+        if exp >= selected_day:
+            default_expiry_index = idx_exp
+            break
+
+    expiry_date = m3.selectbox("Option expiry", options=expiry_options, index=default_expiry_index, format_func=lambda d: d.strftime("%d-%b-%Y"))
     expiry_time = m4.time_input("Expiry time", time(15, 30))
     rate = m5.number_input("Risk-free %", 6.5, step=.25) / 100
     div = m6.number_input("Dividend %", 0.0, step=.25) / 100
@@ -481,7 +647,6 @@ else:
     idx=0
 
 snap=chain[chain["datetime"]==times[idx]].copy() if ("datetime" in chain.columns and times) else chain.copy()
-# use the simulated spot if available; otherwise ATM input
 spot=float(snap["spot"].iloc[0]) if "spot" in snap.columns and not snap.empty else float(atm)
 expiry_dt=pd.Timestamp(datetime.combine(expiry_date,expiry_time),tz="UTC")
 rt=pd.Timestamp(times[idx]) if times else pd.Timestamp(selected_day)
@@ -587,7 +752,7 @@ with tab_terminal:
 
     # Global execution inputs
     chain_exec1, chain_exec2, chain_exec3 = st.columns([1, 1, 1])
-    chain_qty = chain_exec1.number_input("Trade Quantity", 25, 100000, 50, step=25)
+    chain_qty = chain_exec1.number_input("Trade Quantity (Lots)", 25, 100000, 50, step=25)
     chain_sl = chain_exec2.number_input("Default Stop Loss % (0 to disable)", 0.0, 100.0, 0.0, step=1.0)
     chain_tp = chain_exec3.number_input("Default Take Profit % (0 to disable)", 0.0, 100.0, 0.0, step=1.0)
 
@@ -610,55 +775,18 @@ with tab_terminal:
 
         cols = st.columns([1, 1.2, 1.2, 1.2, 1.2, 1.2, 1, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2])
 
-        # CE buttons
+        # CE buttons (Acting as dynamic Toggle Switches!)
         if ce is not None:
-            if cols[0].button("BUY", key=f"bce{strike}", use_container_width=True):
-                new_pos = {
-                    "id": str(uuid.uuid4()),
-                    "right": "CALL",
-                    "strike": float(strike),
-                    "side": "BUY",
-                    "qty": int(chain_qty),
-                    "avg": float(ce.LTP),
-                    "sl_pct": float(chain_sl) if chain_sl > 0 else None,
-                    "tp_pct": float(chain_tp) if chain_tp > 0 else None,
-                    "entry_time": str(pd.Timestamp(times[idx]))
-                }
-                st.session_state.positions.append(new_pos)
-                st.session_state.cash -= int(chain_qty) * float(ce.LTP)
-                st.session_state.trade_history.append({
-                    "time": pd.Timestamp(times[idx]),
-                    "action": "BUY (CE)",
-                    "right": "CALL",
-                    "strike": float(strike),
-                    "qty": int(chain_qty),
-                    "price": float(ce.LTP),
-                    "realized": 0.0
-                })
+            # BUY CE Toggle Button
+            buy_ce_label = "UNBUY" if ce_b > 0 else "BUY"
+            if cols[0].button(buy_ce_label, key=f"bce{strike}", use_container_width=True):
+                toggle_chain_trade(strike, "CALL", "BUY", ce.LTP, chain_qty, chain_sl, chain_tp, times, idx)
                 st.rerun()
-            if cols[1].button("SELL", key=f"sce{strike}", use_container_width=True):
-                new_pos = {
-                    "id": str(uuid.uuid4()),
-                    "right": "CALL",
-                    "strike": float(strike),
-                    "side": "SELL",
-                    "qty": int(chain_qty),
-                    "avg": float(ce.LTP),
-                    "sl_pct": float(chain_sl) if chain_sl > 0 else None,
-                    "tp_pct": float(chain_tp) if chain_tp > 0 else None,
-                    "entry_time": str(pd.Timestamp(times[idx]))
-                }
-                st.session_state.positions.append(new_pos)
-                st.session_state.cash += int(chain_qty) * float(ce.LTP)
-                st.session_state.trade_history.append({
-                    "time": pd.Timestamp(times[idx]),
-                    "action": "SELL (CE)",
-                    "right": "CALL",
-                    "strike": float(strike),
-                    "qty": int(chain_qty),
-                    "price": float(ce.LTP),
-                    "realized": 0.0
-                })
+
+            # SELL CE Toggle Button
+            sell_ce_label = "UNSELL" if ce_s > 0 else "SELL"
+            if cols[1].button(sell_ce_label, key=f"sce{strike}", use_container_width=True):
+                toggle_chain_trade(strike, "CALL", "SELL", ce.LTP, chain_qty, chain_sl, chain_tp, times, idx)
                 st.rerun()
 
             # CE LTP cell styling with dynamic In-The-Money highlighting & net quantity display
@@ -667,10 +795,13 @@ with tab_terminal:
             else:
                 ce_ltp_html = f"<div style='text-align: center; color: #e2e8f0;'>₹{ce.LTP:.2f}</div>"
 
+            # Render Lot Badges: e.g. B (1x), S (2x) directly over that cell
             if ce_net > 0:
-                ce_ltp_html += f"<div style='text-align: center; color: #4ade80; font-size: 0.8rem; font-weight: bold; margin-top: 3px;'>🟢 Long: {ce_net}</div>"
+                ce_lots = int(ce_net // 50) if ce_net >= 50 else 1
+                ce_ltp_html += f"<div style='text-align: center; margin-top: 3px;'><span style='background-color: #22c55e2c; color: #22c55e; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.75rem;'>B ({ce_lots}x)</span></div>"
             elif ce_net < 0:
-                ce_ltp_html += f"<div style='text-align: center; color: #f87171; font-size: 0.8rem; font-weight: bold; margin-top: 3px;'>🔴 Short: {abs(ce_net)}</div>"
+                ce_lots = int(abs(ce_net) // 50) if abs(ce_net) >= 50 else 1
+                ce_ltp_html += f"<div style='text-align: center; margin-top: 3px;'><span style='background-color: #ef44442c; color: #ef4444; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.75rem;'>S ({ce_lots}x)</span></div>"
 
             cols[2].markdown(ce_ltp_html, unsafe_allow_html=True)
             cols[3].markdown(f"<div style='text-align: center;'>{ce['IV %']:.1f}%</div>", unsafe_allow_html=True)
@@ -680,78 +811,43 @@ with tab_terminal:
             for i in range(6): cols[i].write("")
 
         # Strike Center styled with clean font color and prominent highlight for high contrast readability
-        # If strike is nearest ATM, highlight with bright green outline
         if abs(strike - spot) <= step * 0.51:
             cols[6].markdown(f"<div style='text-align: center; font-weight: bold; background-color: #020617; border: 2.5px solid #22c55e; padding: 2px 5px; border-radius: 4px; color: #38bdf8; font-size: 1.1rem; box-shadow: 0 0 10px #22c55e40;'>{strike:,.0f}</div>", unsafe_allow_html=True)
         else:
             cols[6].markdown(f"<div style='text-align: center; font-weight: bold; background-color: #1e293b; border: 1px solid #475569; padding: 2px 5px; border-radius: 4px; color: #38bdf8; font-size: 1.0rem;'>{strike:,.0f}</div>", unsafe_allow_html=True)
 
-        # PE buttons
+        # PE buttons (Acting as dynamic Toggle Switches!)
         if pe is not None:
+            # BUY PE Toggle Button
+            buy_pe_label = "UNBUY" if pe_b > 0 else "BUY"
+            if cols[11].button(buy_pe_label, key=f"bpe{strike}", use_container_width=True):
+                toggle_chain_trade(strike, "PUT", "BUY", pe.LTP, chain_qty, chain_sl, chain_tp, times, idx)
+                st.rerun()
+
+            # SELL PE Toggle Button
+            sell_pe_label = "UNSELL" if pe_s > 0 else "SELL"
+            if cols[12].button(sell_pe_label, key=f"spe{strike}", use_container_width=True):
+                toggle_chain_trade(strike, "PUT", "SELL", pe.LTP, chain_qty, chain_sl, chain_tp, times, idx)
+                st.rerun()
+
             # PE LTP cell styling with dynamic In-The-Money highlighting & net quantity display
             if pe_is_itm:
                 pe_ltp_html = f"<div style='text-align: center; background-color: #c084fc15; border: 1px solid #c084fc40; border-radius: 4px; padding: 2px 5px;'><span style='color: #c084fc; font-weight: bold;'>₹{pe.LTP:.2f}</span> <span style='font-size: 0.75rem; background-color: #c084fc2c; padding: 2px 4px; border-radius: 3px; color: #c084fc; font-weight: bold;'>ITM</span></div>"
             else:
                 pe_ltp_html = f"<div style='text-align: center; color: #e2e8f0;'>₹{pe.LTP:.2f}</div>"
 
+            # Render Lot Badges: e.g. B (1x), S (2x) directly over that cell
             if pe_net > 0:
-                pe_ltp_html += f"<div style='text-align: center; color: #4ade80; font-size: 0.8rem; font-weight: bold; margin-top: 3px;'>🟢 Long: {pe_net}</div>"
+                pe_lots = int(pe_net // 50) if pe_net >= 50 else 1
+                pe_ltp_html += f"<div style='text-align: center; margin-top: 3px;'><span style='background-color: #22c55e2c; color: #22c55e; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.75rem;'>B ({pe_lots}x)</span></div>"
             elif pe_net < 0:
-                pe_ltp_html += f"<div style='text-align: center; color: #f87171; font-size: 0.8rem; font-weight: bold; margin-top: 3px;'>🔴 Short: {abs(pe_net)}</div>"
+                pe_lots = int(abs(pe_net) // 50) if abs(pe_net) >= 50 else 1
+                pe_ltp_html += f"<div style='text-align: center; margin-top: 3px;'><span style='background-color: #ef44442c; color: #ef4444; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.75rem;'>S ({pe_lots}x)</span></div>"
 
             cols[7].markdown(pe_ltp_html, unsafe_allow_html=True)
             cols[8].markdown(f"<div style='text-align: center;'>{pe['IV %']:.1f}%</div>", unsafe_allow_html=True)
             cols[9].markdown(f"<div style='text-align: center;'>{pe.Delta:.2f}</div>", unsafe_allow_html=True)
             cols[10].markdown(f"<div style='text-align: center;'>{pe.Theta:.1f}</div>", unsafe_allow_html=True)
-
-            if cols[11].button("BUY", key=f"bpe{strike}", use_container_width=True):
-                new_pos = {
-                    "id": str(uuid.uuid4()),
-                    "right": "PUT",
-                    "strike": float(strike),
-                    "side": "BUY",
-                    "qty": int(chain_qty),
-                    "avg": float(pe.LTP),
-                    "sl_pct": float(chain_sl) if chain_sl > 0 else None,
-                    "tp_pct": float(chain_tp) if chain_tp > 0 else None,
-                    "entry_time": str(pd.Timestamp(times[idx]))
-                }
-                st.session_state.positions.append(new_pos)
-                st.session_state.cash -= int(chain_qty) * float(pe.LTP)
-                st.session_state.trade_history.append({
-                    "time": pd.Timestamp(times[idx]),
-                    "action": "BUY (PE)",
-                    "right": "PUT",
-                    "strike": float(strike),
-                    "qty": int(chain_qty),
-                    "price": float(pe.LTP),
-                    "realized": 0.0
-                })
-                st.rerun()
-            if cols[12].button("SELL", key=f"spe{strike}", use_container_width=True):
-                new_pos = {
-                    "id": str(uuid.uuid4()),
-                    "right": "PUT",
-                    "strike": float(strike),
-                    "side": "SELL",
-                    "qty": int(chain_qty),
-                    "avg": float(pe.LTP),
-                    "sl_pct": float(chain_sl) if chain_sl > 0 else None,
-                    "tp_pct": float(chain_tp) if chain_tp > 0 else None,
-                    "entry_time": str(pd.Timestamp(times[idx]))
-                }
-                st.session_state.positions.append(new_pos)
-                st.session_state.cash += int(chain_qty) * float(pe.LTP)
-                st.session_state.trade_history.append({
-                    "time": pd.Timestamp(times[idx]),
-                    "action": "SELL (PE)",
-                    "right": "PUT",
-                    "strike": float(strike),
-                    "qty": int(chain_qty),
-                    "price": float(pe.LTP),
-                    "realized": 0.0
-                })
-                st.rerun()
 
     # Strategy Builder Section
     st.markdown("---")
@@ -833,10 +929,8 @@ with tab_terminal:
 
     # Active/Draft strategy overview
     if st.session_state.strategy_legs:
-        # Pre-populate leg premiums based on current view/quotes
         draft_legs = []
         for l in st.session_state.strategy_legs:
-            # find quote
             l_row = view[(view.Strike==l["strike"])&(view.Right==l["right"])]
             premium = float(l_row.iloc[0].LTP) if not l_row.empty else l.get("premium", 0.0)
             l["premium"] = premium
@@ -881,60 +975,42 @@ with tab_terminal:
             st.session_state.strategy_legs = []
             st.rerun()
 
-        # Draw Expiry Payoff Preview
-        spots = np.linspace(max(1, spot - step * 10), spot + step * 10, 161)
-        pnl = payoff(draft_legs, spots)
-        fig2 = go.Figure(go.Scatter(x=spots, y=pnl, mode="lines", fill="tozeroy", name="P&L"))
-        fig2.add_vline(x=spot, line_dash="dash", line_color="orange", annotation_text="Current Spot")
-        fig2.add_hline(y=0, line_dash="dot", line_color="grey")
-        fig2.update_layout(height=350, title="Preview: Expiry Payoff / P&L (Selected Draft Strategy)", xaxis_title="Underlying Strike", yaxis_title="P&L (₹)")
-        st.plotly_chart(fig2, use_container_width=True)
-
 # ---------- TAB 2: Positions & Analytics ----------
 with tab_positions:
     st.subheader("💼 Active Positions")
     if portfolio.empty:
         st.info("No active positions currently. Head to the Option Terminal to place some trades!")
     else:
-        # Square Off All Button
-        if st.button("🚨 Square Off All Positions", type="primary", use_container_width=True):
-            for i, p in portfolio.iterrows():
-                p_id = p["id"]
-                pos = next((item for item in st.session_state.positions if item.get("id") == p_id), None)
-                if pos:
-                    r = pos["right"]
-                    k = pos["strike"]
-                    side = pos["side"]
-                    qty = pos["qty"]
-                    avg = pos["avg"]
-
-                    ltp = quotes.get((r, k), np.nan)
-                    if np.isfinite(ltp):
-                        realized = 0.0
-                        if side == "BUY":
-                            st.session_state.cash += qty * ltp
-                            realized = (ltp - avg) * qty
-                        else:
-                            st.session_state.cash -= qty * ltp
-                            realized = (avg - ltp) * qty
-
-                        st.session_state.trade_history.append({
-                            "time": pd.Timestamp(times[idx]),
-                            "action": f"SQUARE_OFF_{side}",
-                            "right": r,
-                            "strike": k,
-                            "qty": qty,
-                            "price": ltp,
-                            "realized": realized
-                        })
+        # Prompt selection of "Clear All Positions" to wipe state instantly
+        col_clear_1, col_clear_2 = st.columns([1, 4])
+        if col_clear_1.button("🚨 Clear All Positions", type="primary", use_container_width=True):
             st.session_state.positions = []
+            st.session_state.cash = 1_000_000.0
+            st.session_state.trade_history = []
+            st.session_state.mtm_history = []
             st.rerun()
 
         # Active Position Grid
         for i, row in portfolio.iterrows():
             c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.5, 1, 1, 1, 1.2, 1, 1, 1])
             c1.markdown(f"**{row.Side} {row.Right} {row.Strike:,.0f}**")
-            c2.write(f"Qty {int(row.Qty)}")
+
+            # Dynamic Lot quantity control inline directly inside the Strategy Builder table
+            new_qty = c2.number_input("Qty", 25, 100000, int(row.Qty), step=25, key=f"qty_input_{row.id}")
+            if new_qty != int(row.Qty):
+                # Update position quantity dynamically
+                p_id = row.id
+                pos_index = next((index for index, item in enumerate(st.session_state.positions) if item.get("id") == p_id), None)
+                if pos_index is not None:
+                    # refund cash difference
+                    diff_qty = new_qty - int(row.Qty)
+                    if row.Side == "BUY":
+                        st.session_state.cash -= diff_qty * row.Avg
+                    else:
+                        st.session_state.cash += diff_qty * row.Avg
+                    st.session_state.positions[pos_index]["qty"] = new_qty
+                    st.rerun()
+
             c3.write(f"Avg ₹{row.Avg:.2f}")
             c4.write(f"LTP ₹{row.LTP:.2f}")
             c5.metric("P&L", f"₹{row['Unrealized P&L']:,.2f}")
@@ -945,14 +1021,11 @@ with tab_positions:
             new_sl = c6.number_input("SL %", 0.0, 100.0, sl_val, step=1.0, key=f"sl_input_{row.id}")
             new_tp = c7.number_input("TP %", 0.0, 100.0, tp_val, step=1.0, key=f"tp_input_{row.id}")
 
-            # Apply individual changes if inputs changed
             p_id = row.id
             pos_index = next((index for index, item in enumerate(st.session_state.positions) if item.get("id") == p_id), None)
             if pos_index is not None:
                 orig_sl = st.session_state.positions[pos_index].get("sl_pct")
                 orig_tp = st.session_state.positions[pos_index].get("tp_pct")
-
-                # Update SL / TP in real-time
                 updated_sl = new_sl if new_sl > 0 else None
                 updated_tp = new_tp if new_tp > 0 else None
                 if orig_sl != updated_sl or orig_tp != updated_tp:
@@ -960,7 +1033,6 @@ with tab_positions:
                     st.session_state.positions[pos_index]["tp_pct"] = updated_tp
 
             if c8.button("Exit Leg", key=f"exit_{row.id}", use_container_width=True):
-                # Process manual close
                 p_id = row.id
                 pos = next((item for item in st.session_state.positions if item.get("id") == p_id), None)
                 if pos:
@@ -1003,7 +1075,6 @@ with tab_positions:
     net_vega = 0.0
 
     for i, row in portfolio.iterrows():
-        # Get greeks for current leg
         match_view = view[(view.Strike == row.Strike) & (view.Right == row.Right)]
         if not match_view.empty:
             g_row = match_view.iloc[0]
@@ -1023,33 +1094,20 @@ with tab_positions:
 
     # Interactive charts
     st.markdown("---")
-    col_chart1, col_chart2 = st.columns(2)
 
-    with col_chart1:
-        if not mh.empty:
-            mtm_fig=go.Figure(go.Scatter(x=mh.time, y=mh.mtm, mode="lines+markers", name="MTM P&L", fill="tozeroy"))
-            mtm_fig.add_hline(y=0, line_dash="dot", line_color="grey")
-            mtm_fig.update_layout(height=330, title="Cumulative MTM fluctuation over replay time", xaxis_title="Replay time", yaxis_title="P&L (₹)")
-            st.plotly_chart(mtm_fig, use_container_width=True)
-
-    with col_chart2:
-        if not portfolio.empty:
-            active_legs = []
-            for i, row in portfolio.iterrows():
-                active_legs.append({
-                    "side": row.Side,
-                    "right": row.Right,
-                    "strike": float(row.Strike),
-                    "qty": int(row.Qty),
-                    "premium": float(row.Avg)
-                })
-            spots = np.linspace(max(1, spot - step * 10), spot + step * 10, 161)
-            pnl = payoff(active_legs, spots)
-            fig3 = go.Figure(go.Scatter(x=spots, y=pnl, mode="lines", fill="tozeroy", name="P&L"))
-            fig3.add_vline(x=spot, line_dash="dash", line_color="orange", annotation_text="Current Spot")
-            fig3.add_hline(y=0, line_dash="dot", line_color="grey")
-            fig3.update_layout(height=330, title="Portfolio Expiry Payoff / P&L Diagram", xaxis_title="Underlying Strike", yaxis_title="P&L (₹)")
-            st.plotly_chart(fig3, use_container_width=True)
+    if not portfolio.empty:
+        active_legs = []
+        for i, row in portfolio.iterrows():
+            active_legs.append({
+                "side": row.Side,
+                "right": row.Right,
+                "strike": float(row.Strike),
+                "qty": int(row.Qty),
+                "premium": float(row.Avg)
+            })
+        # Plotly Consolidated Strategy Payoff Curve
+        fig = draw_consolidated_payoff_chart(active_legs, spot, step, T, rate, div)
+        st.plotly_chart(fig, use_container_width=True)
 
     # Execution trade history
     st.markdown("---")
