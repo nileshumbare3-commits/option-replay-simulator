@@ -1,5 +1,4 @@
 import os
-from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -9,24 +8,9 @@ from breeze_client import BreezeClient
 from greeks import implied_vol, greeks
 
 load_dotenv()
-st.set_page_config(page_title="Breeze Option Simulator", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Breeze Option Replay", page_icon="📈", layout="wide")
 
-# ---------- Theme ----------
-st.markdown("""
-<style>
-.stApp { background:#0b1220; color:#e5e7eb; }
-[data-testid="stSidebar"] { background:#101827; }
-.block-container { padding-top:1rem; max-width:1500px; }
-.card { background:#111c2e; border:1px solid #24334a; border-radius:12px; padding:14px 16px; }
-.small { color:#94a3b8; font-size:12px; }
-.big { font-size:25px; font-weight:700; }
-.buy { color:#22c55e; font-weight:700; }
-.sell { color:#ef4444; font-weight:700; }
-.atm { background:#1d2a3d; border-radius:5px; }
-</style>
-""", unsafe_allow_html=True)
-
-# ---------- Helpers ----------
+# ---------- helpers ----------
 def norm(rows):
     df = pd.DataFrame(rows)
     if df.empty or "datetime" not in df or "close" not in df:
@@ -42,185 +26,220 @@ def get_hist(api_key, session, symbol, start, end, expiry, right, strike, interv
     c = BreezeClient(api_key=api_key, secret_key=os.getenv("BREEZE_SECRET_KEY"), session_token=session)
     return norm(c.historical_option(symbol, start, end, expiry, right, strike, interval))
 
-def demo_chain(symbol, atm, step, count):
-    rng = np.random.default_rng(42)
-    start = pd.Timestamp("2026-08-07 09:15", tz="UTC")
-    times = pd.date_range(start, periods=76, freq="5min")
-    spot_path = atm + np.cumsum(rng.normal(0, step * 0.06, len(times)))
+def demo_chain(atm, step, count):
+    rng = np.random.default_rng(7)
+    times = pd.date_range("2026-08-07 09:15", "2026-08-07 15:30", freq="5min")
     strikes = [round(atm + (i - count // 2) * step, 2) for i in range(count)]
     rows = []
-    expiry = pd.Timestamp("2026-08-13 10:00", tz="UTC")
-    for t, spot in zip(times, spot_path):
-        T = max((expiry - t).total_seconds() / (365 * 86400), 1e-5)
+    spot_path = atm + np.cumsum(rng.normal(0, step * .025, len(times)))
+    for ti, ts in enumerate(times):
+        spot = spot_path[ti]
         for k in strikes:
-            m = (spot-k)/max(spot,1)
-            base = max(abs(spot-k)*0.55, 8) * (0.85 + 0.35*np.exp(-abs(m)*35))
+            m = max(abs(spot - k), step * .1)
             for right in ["call", "put"]:
-                intrinsic = max(spot-k,0) if right=="call" else max(k-spot,0)
-                ltp = intrinsic + base + rng.normal(0, 1.2)
-                rows.append({"datetime":t,"close":max(0.5,ltp),"volume":int(rng.integers(1000,25000)),"open_interest":int(rng.integers(5000,150000)),"strike":k,"right":right,"spot":spot})
-    return pd.DataFrame(rows)
+                intrinsic = max(spot-k, 0) if right == "call" else max(k-spot, 0)
+                time_value = max(5, step * .8 * np.exp(-m / (step * 2)))
+                noise = rng.normal(0, .8)
+                price = max(.5, intrinsic + time_value + noise)
+                rows.append({"datetime": ts, "close": price, "volume": int(rng.integers(500, 15000)),
+                             "open_interest": int(rng.integers(5000, 90000)), "strike": k, "right": right})
+    return pd.DataFrame(rows), times
 
-def make_greeks(chain, spot, expiry, now, rate, div):
-    out=[]
-    expiry_dt=pd.Timestamp(expiry, tz="UTC") if not pd.Timestamp(expiry).tzinfo else pd.Timestamp(expiry)
-    T=max((expiry_dt-now).total_seconds()/(365*86400),1e-8)
-    for _, r in chain.iterrows():
-        iv=implied_vol(float(r.close),spot,float(r.strike),T,rate,div,r.right)
-        g=greeks(spot,float(r.strike),T,rate,div,iv,r.right)
-        out.append({"Strike":r.strike,"Right":r.right.upper(),"LTP":r.close,"OI":r.get("open_interest",np.nan),"Volume":r.get("volume",np.nan),"IV %":iv*100 if np.isfinite(iv) else np.nan,**{k.title():v for k,v in g.items()}})
-    return pd.DataFrame(out)
+def payoff(legs, spots):
+    total = np.zeros_like(spots, dtype=float)
+    for leg in legs:
+        qty = leg["qty"]
+        strike = leg["strike"]
+        premium = leg["premium"]
+        right = leg["right"]
+        side = leg["side"]
+        intrinsic = np.maximum(spots-strike, 0) if right == "CALL" else np.maximum(strike-spots, 0)
+        per_unit = intrinsic - premium if side == "BUY" else premium - intrinsic
+        total += qty * per_unit
+    return total
 
-# ---------- Session ----------
-client=BreezeClient()
-api_session=st.query_params.get("API_Session") or st.query_params.get("api_session")
-if api_session and client.configured:
-    try:
-        st.session_state["session_token"] = client.exchange_api_session(api_session)
-        st.query_params.clear()
-    except Exception as e:
-        st.error(f"Breeze login failed: {e}")
-session=st.session_state.get("session_token")
+# ---------- session ----------
+if "demo" not in st.session_state:
+    st.session_state.demo = True
+if "positions" not in st.session_state:
+    st.session_state.positions = {}
+if "cash" not in st.session_state:
+    st.session_state.cash = 1_000_000.0
+if "strategy_legs" not in st.session_state:
+    st.session_state.strategy_legs = []
 
-# ---------- Sidebar ----------
+st.markdown("""
+<style>
+.block-container {padding-top: 1rem; max-width: 1700px;}
+.metric-card {padding: 12px 16px; border: 1px solid rgba(128,128,128,.25); border-radius: 12px;}
+.small-muted {color:#8b949e; font-size:.85rem;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("📈 Breeze Option Replay")
+st.caption("Historical paper-trading simulator • No live orders")
+
+# ---------- top controls ----------
+with st.container(border=True):
+    a,b,c,d,e,f = st.columns([1.2,1.2,1.3,1.5,1.3,1.2])
+    symbol = a.selectbox("Underlying", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0)
+    mode = b.selectbox("Data mode", ["Demo", "Breeze"])
+    expiry = c.text_input("Expiry", "2026-08-13T06:00:00.000Z")
+    interval = d.selectbox("Interval", ["1minute", "5minute", "15minute", "30minute", "1day"], index=1)
+    atm = e.number_input("ATM", 1000.0, step=50.0, value=25000.0)
+    step = f.number_input("Strike step", 5.0, step=50.0, value=50.0)
+
+client = BreezeClient()
 with st.sidebar:
-    st.markdown("## 📊 Option Replay")
-    mode=st.radio("Data source", ["Demo Mode", "ICICI Breeze"], horizontal=True)
-    st.divider()
-    st.subheader("Market")
-    symbol=st.selectbox("Underlying", ["NIFTY", "BANKNIFTY", "FINNIFTY"])
-    atm=st.number_input("ATM strike", value=25000.0 if symbol=="NIFTY" else 55000.0, step=50.0)
-    step=st.number_input("Strike interval", value=50.0, min_value=0.05, step=50.0)
-    count=st.slider("Strikes", 10, 20, 20)
-    rate=st.number_input("Risk-free rate %", value=6.5, step=0.25)/100
-    div=st.number_input("Dividend yield %", value=0.0, step=0.25)/100
-    st.divider()
-    if mode=="ICICI Breeze":
-        st.subheader("🔐 Breeze connection")
-        if client.configured:
-            st.link_button("Connect ICICI Direct", client.login_url(), use_container_width=True)
-            st.caption("API secrets stay in .env/server secrets.")
-            st.success("Connected" if session else "Not connected")
-        else:
-            st.warning("Add BREEZE_API_KEY and BREEZE_SECRET_KEY to .env")
-    st.divider()
-    st.caption("Paper trading only • No live orders")
+    st.header("🔐 Connection")
+    if client.configured:
+        st.link_button("Connect ICICI Direct", client.login_url(), use_container_width=True)
+    else:
+        st.info("Breeze credentials are not configured. Demo mode is available now.")
+    api_session = st.query_params.get("API_Session") or st.query_params.get("api_session")
+    if api_session and client.configured:
+        try:
+            st.session_state["session_token"] = client.exchange_api_session(api_session)
+            st.query_params.clear()
+        except Exception as ex:
+            st.error(str(ex))
+    if st.session_state.get("session_token"):
+        st.success("● Breeze connected")
+    else:
+        st.warning("● Paper / Demo")
 
-# ---------- Header ----------
-st.markdown("# 📈 Breeze Option Simulator")
-status="🟢 Demo market" if mode=="Demo Mode" else ("🟢 Breeze connected" if session else "🟠 Breeze login required")
-st.markdown(f"<span class='small'>{status} &nbsp; • &nbsp; Historical replay &nbsp; • &nbsp; Paper trading</span>", unsafe_allow_html=True)
-
-# ---------- Data controls ----------
-if mode=="ICICI Breeze":
-    c1,c2,c3,c4=st.columns(4)
-    expiry=c1.text_input("Expiry ISO", "2026-08-13T06:00:00.000Z")
-    start=c2.text_input("Start ISO", "2026-08-07T09:15:00.000Z")
-    end=c3.text_input("End ISO", "2026-08-07T15:30:00.000Z")
-    interval=c4.selectbox("Interval", ["1minute","5minute","30minute","1day"], index=1)
-    if st.button("⬇️ Load historical data", type="primary", use_container_width=True):
-        if not session:
-            st.error("Connect ICICI Direct first.")
+with st.sidebar:
+    st.header("⏱ Replay")
+    start = st.text_input("Start", "2026-08-07T09:15:00.000Z")
+    end = st.text_input("End", "2026-08-07T15:30:00.000Z")
+    strike_count = st.slider("Strikes", 4, 20, 20)
+    rate = st.number_input("Risk-free %", 6.5, step=.25) / 100
+    div = st.number_input("Dividend %", 0.0, step=.25) / 100
+    if st.button("🔄 Load / Generate Chain", type="primary", use_container_width=True):
+        if mode == "Demo":
+            chain, times = demo_chain(atm, step, strike_count)
         else:
-            frames=[]
-            with st.spinner("Loading historical option chain..."):
-                strikes=sorted(round(atm+(i-count//2)*step,2) for i in range(count))
+            session = st.session_state.get("session_token")
+            if not session:
+                st.error("Connect Breeze first.")
+                chain, times = pd.DataFrame(), []
+            else:
+                frames = []
+                strikes = sorted(round(atm + (i-strike_count//2)*step, 2) for i in range(strike_count))
                 for k in strikes:
-                    for right in ["call","put"]:
+                    for right in ["call", "put"]:
                         try:
-                            d=get_hist(client.api_key,session,symbol,start,end,expiry,right,k,interval)
-                            if not d.empty:
-                                d["strike"]=k; d["right"]=right; frames.append(d)
-                        except Exception as e:
-                            st.warning(f"{right.upper()} {k}: {e}")
-            st.session_state.chain=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
-            st.session_state.idx=0
-            st.session_state.expiry=expiry
-else:
-    expiry="2026-08-13T10:00:00Z"
-    if "chain" not in st.session_state or st.session_state.get("demo_key")!=(symbol,atm,step,count):
-        st.session_state.chain=demo_chain(symbol,atm,step,count)
-        st.session_state.demo_key=(symbol,atm,step,count)
-        st.session_state.idx=0
-        st.session_state.expiry=expiry
+                            d0 = get_hist(client.api_key, session, symbol, start, end, expiry, right, k, interval)
+                            if not d0.empty:
+                                d0["strike"] = k; d0["right"] = right; frames.append(d0)
+                        except Exception as ex:
+                            st.warning(f"{right.upper()} {k}: {ex}")
+                chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
+        st.session_state.chain = chain
+        st.session_state.times = times
+        st.session_state.idx = 0
 
-chain=st.session_state.get("chain",pd.DataFrame())
+chain = st.session_state.get("chain", pd.DataFrame())
+times = st.session_state.get("times", [])
 if chain.empty:
-    st.info("Choose Demo Mode to explore the interface immediately, or connect Breeze and load historical data.")
+    st.info("👈 Choose Demo mode and click **Load / Generate Chain** to explore the simulator without API credentials.")
     st.stop()
 
-# ---------- Replay toolbar ----------
-times=sorted(chain.datetime.dropna().unique())
-idx=min(st.session_state.get("idx",0),len(times)-1)
-now=pd.Timestamp(times[idx]);
+idx = min(st.session_state.get("idx", 0), len(times)-1)
+with st.container(border=True):
+    p1,p2,p3,p4,p5 = st.columns([1,1,1,1,2])
+    if p1.button("⏮", use_container_width=True): st.session_state.idx = max(0, idx-1); st.rerun()
+    if p2.button("▶ Next", use_container_width=True): st.session_state.idx = min(len(times)-1, idx+1); st.rerun()
+    if p3.button("⏪ -5", use_container_width=True): st.session_state.idx = max(0, idx-5); st.rerun()
+    if p4.button("⏩ +5", use_container_width=True): st.session_state.idx = min(len(times)-1, idx+5); st.rerun()
+    p5.metric("Replay time", pd.Timestamp(times[idx]).strftime("%d %b %Y  %H:%M"))
 
-b1,b2,b3,b4,b5,b6=st.columns([1,1,1.5,1.2,1.2,1.5])
-if b1.button("⏮", use_container_width=True): st.session_state.idx=max(0,idx-1); st.rerun()
-if b2.button("▶ Next", use_container_width=True): st.session_state.idx=min(len(times)-1,idx+1); st.rerun()
-b3.markdown(f"**Replay:** `{now.strftime('%d %b %Y  %H:%M')}`")
-speed=b4.selectbox("Speed", ["0.5×","1×","2×","5×"], index=1, label_visibility="collapsed")
-spot_default=float(chain.loc[chain.datetime==now,"spot"].iloc[0]) if "spot" in chain.columns else float(atm)
-spot=b5.number_input("Spot", value=round(spot_default,2), step=float(step), label_visibility="collapsed")
-if b6.button("↺ Reset replay", use_container_width=True): st.session_state.idx=0; st.rerun()
+snap = chain[chain.datetime == times[idx]].copy()
+spot = st.number_input("Underlying spot", value=float(atm), step=float(step))
+expiry_dt = pd.to_datetime(expiry, utc=True, errors="coerce")
+rt = pd.Timestamp(times[idx]); rt = rt.tz_localize("UTC") if rt.tzinfo is None else rt.tz_convert("UTC")
+T = max((expiry_dt-rt).total_seconds()/(365*24*3600), 1e-8) if pd.notna(expiry_dt) else 1e-8
 
-view=make_greeks(chain[chain.datetime==now],spot,st.session_state.get("expiry",expiry),now,rate,div)
-near=min(view.Strike,key=lambda x:abs(x-spot))
+out=[]
+for _, r in snap.iterrows():
+    iv = implied_vol(float(r.close), spot, float(r.strike), T, rate, div, r.right)
+    g = greeks(spot, float(r.strike), T, rate, div, iv, r.right)
+    out.append({"Strike":r.strike,"Right":r.right.upper(),"LTP":r.close,"Volume":r.get("volume",np.nan),"OI":r.get("open_interest",np.nan),"IV %":iv*100 if np.isfinite(iv) else np.nan, **{k.title():v for k,v in g.items()}})
+view=pd.DataFrame(out).sort_values(["Strike","Right"])
 
-# ---------- KPI row ----------
-ce,pe,ivm=st.columns(3)
-atm_rows=view[view.Strike==near]
-call_ltp=float(atm_rows[atm_rows.Right=="CALL"].LTP.iloc[0]) if not atm_rows[atm_rows.Right=="CALL"].empty else 0
-put_ltp=float(atm_rows[atm_rows.Right=="PUT"].LTP.iloc[0]) if not atm_rows[atm_rows.Right=="PUT"].empty else 0
-ce.metric(f"ATM {near} CE", f"₹{call_ltp:,.2f}")
-pe.metric(f"ATM {near} PE", f"₹{put_ltp:,.2f}")
-ivm.metric("ATM IV", f"{float(atm_rows['IV %'].mean()):.2f}%" if not atm_rows.empty else "—")
-
-# ---------- Option chain ----------
+# ---------- option chain + click-to-ticket ----------
 st.subheader("Option Chain")
-st.caption("Click an option by selecting it in the paper-order ticket below. ATM strike is highlighted conceptually by the Spot/Strike relationship.")
-left=view[view.Right=="CALL"].set_index("Strike")
-right=view[view.Right=="PUT"].set_index("Strike")
-chain_ui=pd.DataFrame(index=sorted(view.Strike.unique()))
-for col,src,name in [("Call LTP",left,"LTP"),("Call IV %",left,"IV %"),("Δ CE",left,"Delta"),("Γ CE",left,"Gamma"),("Θ CE",left,"Theta"),("CE OI",left,"OI")]: chain_ui[col]=src[name]
-chain_ui["STRIKE"]=chain_ui.index
-for col,src,name in [("PE OI",right,"OI"),("Θ PE",right,"Theta"),("Γ PE",right,"Gamma"),("Δ PE",right,"Delta"),("Put IV %",right,"IV %"),("Put LTP",right,"LTP")]: chain_ui[col]=src[name]
-cols=["Call LTP","Call IV %","Δ CE","Γ CE","Θ CE","CE OI","STRIKE","PE OI","Θ PE","Γ PE","Δ PE","Put IV %","Put LTP"]
-st.dataframe(chain_ui[cols].round(2), use_container_width=True, height=520)
+left, right = st.columns([5, 2])
+with left:
+    st.dataframe(view, use_container_width=True, hide_index=True, height=520,
+                 column_config={"LTP":st.column_config.NumberColumn(format="₹%.2f"), "IV %":st.column_config.NumberColumn(format="%.2f")})
+with right:
+    st.markdown("### 🎯 Order Ticket")
+    selected_right = st.selectbox("Option", ["CALL", "PUT"])
+    selected_strike = st.selectbox("Strike", sorted(view.Strike.unique()), index=len(sorted(view.Strike.unique()))//2)
+    selected_side = st.radio("Action", ["BUY", "SELL"], horizontal=True)
+    selected_qty = st.number_input("Quantity", 1, 100000, 50, step=50)
+    rr = view[(view.Strike == selected_strike) & (view.Right == selected_right)]
+    selected_price = float(rr.iloc[0].LTP) if not rr.empty else 0
+    st.metric("Market price", f"₹{selected_price:,.2f}")
+    if st.button(f"{selected_side} {selected_right}", type="primary", use_container_width=True):
+        key=(selected_right,float(selected_strike)); signed=selected_qty if selected_side=="BUY" else -selected_qty
+        st.session_state.positions[key]=st.session_state.positions.get(key,0)+signed
+        st.session_state.cash -= signed*selected_price
+        st.success(f"Paper order: {selected_side} {selected_qty} {selected_right} {selected_strike}")
 
-# ---------- Chart ----------
-st.subheader("Replay Chart")
-chart_data=chain[chain.strike==near].sort_values("datetime")
+# ---------- chart ----------
+near=min(view.Strike.unique(), key=lambda x: abs(x-spot))
+plot=chain[chain.strike==near]
 fig=go.Figure()
-for r in ["call","put"]:
-    p=chart_data[chart_data.right==r]
-    fig.add_trace(go.Scatter(x=p.datetime,y=p.close,mode="lines",name=r.upper()))
-fig.add_vline(x=now,line_dash="dash",annotation_text="Replay")
-fig.update_layout(height=360,margin=dict(l=10,r=10,t=10,b=10),template="plotly_dark",paper_bgcolor="#111c2e",plot_bgcolor="#111c2e",legend=dict(orientation="h"))
-st.plotly_chart(fig,use_container_width=True)
+for right_name in ["call","put"]:
+    p=plot[plot.right==right_name].sort_values("datetime")
+    fig.add_trace(go.Scatter(x=p.datetime,y=p.close,mode="lines",name=right_name.upper()))
+fig.add_vline(x=pd.Timestamp(times[idx]), line_dash="dash")
+fig.update_layout(height=360, margin=dict(l=10,r=10,t=30,b=10), title=f"ATM option replay • {near}")
+st.plotly_chart(fig, use_container_width=True)
 
-# ---------- Paper trading ----------
-st.subheader("🛒 Paper Order")
-o1,o2,o3,o4,o5=st.columns([1,1,1.3,1.2,1])
-side=o1.selectbox("Side",["BUY","SELL"]); right_sel=o2.selectbox("Option",["CALL","PUT"]); strike=o3.selectbox("Strike",sorted(view.Strike.unique()),index=list(sorted(view.Strike.unique())).index(near)); qty=o4.number_input("Quantity",1,100000,50,step=50); o5.markdown(f"**LTP**\n\n₹{float(view[(view.Strike==strike)&(view.Right==right_sel)].LTP.iloc[0]):,.2f}")
-price=float(view[(view.Strike==strike)&(view.Right==right_sel)].LTP.iloc[0])
-if st.button(f"{('🟢' if side=='BUY' else '🔴')} {side} {right_sel} {strike}", type="primary", use_container_width=True):
-    positions=st.session_state.setdefault("positions",{})
-    key=(right_sel,float(strike)); signed=qty if side=="BUY" else -qty
-    positions[key]=positions.get(key,0)+signed
-    st.session_state.cash=st.session_state.get("cash",1_000_000.0)-signed*price
-    st.success(f"Paper order filled: {side} {qty} {right_sel} {strike} @ ₹{price:,.2f}")
+# ---------- strategy builder ----------
+st.subheader("🧩 Strategy Builder")
+with st.container(border=True):
+    s1,s2,s3,s4,s5,s6 = st.columns([1.2,1.2,1.4,1.2,1.2,1.2])
+    leg_side=s1.selectbox("Side", ["BUY","SELL"], key="leg_side")
+    leg_right=s2.selectbox("Type", ["CALL","PUT"], key="leg_right")
+    leg_strike=s3.selectbox("Strike", sorted(view.Strike.unique()), key="leg_strike")
+    leg_qty=s4.number_input("Qty", 1, 100000, 50, step=50, key="leg_qty")
+    leg_row=view[(view.Strike==leg_strike)&(view.Right==leg_right)]
+    leg_premium=float(leg_row.iloc[0].LTP) if not leg_row.empty else 0
+    s5.metric("Premium", f"₹{leg_premium:.2f}")
+    if s6.button("+ Add leg", use_container_width=True):
+        st.session_state.strategy_legs.append({"side":leg_side,"right":leg_right,"strike":float(leg_strike),"qty":int(leg_qty),"premium":leg_premium})
 
-# ---------- Portfolio ----------
-st.subheader("💰 Portfolio")
-cash=st.session_state.get("cash",1_000_000.0); rows=[]; unreal=0
-for (r,k),q in st.session_state.get("positions",{}).items():
+if st.session_state.strategy_legs:
+    legs_df=pd.DataFrame(st.session_state.strategy_legs)
+    st.dataframe(legs_df, use_container_width=True, hide_index=True)
+    ca,cb=st.columns([1,1])
+    if ca.button("🗑 Clear strategy"): st.session_state.strategy_legs=[]; st.rerun()
+    spots=np.linspace(max(1, spot-step*20), spot+step*20, 161)
+    pnl=payoff(st.session_state.strategy_legs, spots)
+    fig2=go.Figure(go.Scatter(x=spots,y=pnl,mode="lines",fill="tozeroy",name="P&L"))
+    fig2.add_vline(x=spot,line_dash="dash")
+    fig2.add_hline(y=0,line_dash="dot")
+    fig2.update_layout(height=400, title="Expiry Payoff / P&L", xaxis_title="Underlying at expiry", yaxis_title="P&L (₹)")
+    st.plotly_chart(fig2, use_container_width=True)
+    max_profit=float(np.max(pnl)); max_loss=float(np.min(pnl))
+    m1,m2,m3=st.columns(3); m1.metric("Max profit",f"₹{max_profit:,.0f}"); m2.metric("Max loss",f"₹{max_loss:,.0f}"); m3.metric("Breakeven approx",f"{spots[np.argmin(np.abs(pnl))]:,.0f}")
+
+# ---------- portfolio ----------
+st.subheader("💼 Paper Portfolio")
+positions=[]
+for (r,k),q in st.session_state.positions.items():
     x=view[(view.Strike==k)&(view.Right==r)]
-    l=float(x.LTP.iloc[0]) if not x.empty else np.nan
-    mv=q*l if np.isfinite(l) else 0
-    unreal+=mv
-    rows.append({"Option":f"NIFTY {int(k)} {r}","Qty":q,"LTP":l,"Market Value":mv})
-m1,m2,m3=st.columns(3); m1.metric("Available Cash",f"₹{cash:,.2f}"); m2.metric("Position Value",f"₹{unreal:,.2f}"); m3.metric("Portfolio Value",f"₹{cash+unreal:,.2f}")
-if rows: st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-else: st.info("No paper positions yet.")
-
-st.caption("Demo Mode uses synthetic data for UI exploration. Breeze mode uses your authenticated historical data. This application does not place live orders.")
+    l=float(x.iloc[0].LTP) if not x.empty else np.nan
+    positions.append({"Right":r,"Strike":k,"Qty":q,"LTP":l,"Market Value":q*l if np.isfinite(l) else np.nan})
+portfolio=pd.DataFrame(positions)
+if portfolio.empty:
+    st.info("No paper positions yet.")
+else:
+    st.dataframe(portfolio,use_container_width=True,hide_index=True)
+    unreal=float(portfolio["Market Value"].sum())
+    c1,c2,c3=st.columns(3); c1.metric("Cash",f"₹{st.session_state.cash:,.2f}"); c2.metric("Position value",f"₹{unreal:,.2f}"); c3.metric("Net liquidation",f"₹{st.session_state.cash+unreal:,.2f}")
