@@ -21,8 +21,8 @@ def norm(rows):
     return df.dropna(subset=["datetime","close"])
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_hist(api_key, session, symbol, start, end, expiry, right, strike, interval):
-    c = BreezeClient(api_key=api_key, secret_key=os.getenv("BREEZE_SECRET_KEY"), session_token=session)
+def get_hist(api_key, secret_key, session, symbol, start, end, expiry, right, strike, interval):
+    c = BreezeClient(api_key=api_key, secret_key=secret_key, session_token=session)
     return norm(c.historical_option(symbol, start, end, expiry, right, strike, interval))
 
 def demo_chain(atm, step, count, day):
@@ -212,17 +212,82 @@ if "autoplay" not in st.session_state:
 if "autoplay_speed" not in st.session_state:
     st.session_state.autoplay_speed = 1.0
 
-client=BreezeClient()
+# 1. API Keys configuration from environment variables or session state
+api_key_env = os.getenv("BREEZE_API_KEY", "")
+secret_key_env = os.getenv("BREEZE_SECRET_KEY", "")
+
+if "breeze_api_key" not in st.session_state:
+    st.session_state.breeze_api_key = api_key_env
+if "breeze_secret_key" not in st.session_state:
+    st.session_state.breeze_secret_key = secret_key_env
+
 with st.sidebar:
     st.header("🔐 Connection")
-    if client.configured: st.link_button("Connect ICICI Direct",client.login_url(),use_container_width=True)
-    else: st.info("Demo mode works without credentials.")
-    api_session=st.query_params.get("API_Session") or st.query_params.get("api_session")
+
+    with st.expander("🔑 Configure Breeze API Keys", expanded=not (st.session_state.breeze_api_key and st.session_state.breeze_secret_key)):
+        user_api_key = st.text_input("Breeze API Key", value=st.session_state.breeze_api_key, placeholder="Enter API Key")
+        user_secret_key = st.text_input("Breeze Secret Key", value=st.session_state.breeze_secret_key, type="password", placeholder="Enter Secret Key")
+        if user_api_key != st.session_state.breeze_api_key or user_secret_key != st.session_state.breeze_secret_key:
+            st.session_state.breeze_api_key = user_api_key
+            st.session_state.breeze_secret_key = user_secret_key
+            st.rerun()
+
+    # Create BreezeClient instance
+    client = BreezeClient(
+        api_key=st.session_state.breeze_api_key,
+        secret_key=st.session_state.breeze_secret_key,
+        session_token=st.session_state.get("session_token")
+    )
+
+    if client.configured:
+        st.link_button("🌐 Connect/Login ICICI Direct", client.login_url(), use_container_width=True)
+    else:
+        st.info("Demo mode works without credentials. Enter API credentials above to connect Breeze.")
+
+    # Auto-exchange from query parameters
+    api_session = st.query_params.get("API_Session") or st.query_params.get("api_session")
     if api_session and client.configured:
         try:
-            st.session_state["session_token"]=client.exchange_api_session(api_session); st.query_params.clear()
-        except Exception as ex: st.error(str(ex))
-    st.success("● Breeze connected" if st.session_state.get("session_token") else "● Demo / Paper")
+            with st.spinner("Exchanging redirected session token..."):
+                st.session_state["session_token"] = client.exchange_api_session(api_session)
+            st.query_params.clear()
+            st.rerun()
+        except Exception as ex:
+            st.error(f"Auto-exchange failed: {ex}")
+
+    # Manual Session Token/Exchange
+    if client.configured:
+        manual_session = st.text_input("Manual API Session / Redirect URL", placeholder="Paste api_session or redirected URL")
+        if st.button("🔌 Exchange Session Token", use_container_width=True):
+            if manual_session:
+                token_to_exchange = manual_session
+                if "api_session=" in manual_session:
+                    try:
+                        token_to_exchange = manual_session.split("api_session=")[1].split("&")[0]
+                    except Exception:
+                        pass
+                try:
+                    with st.spinner("Exchanging manual token..."):
+                        session_token = client.exchange_api_session(token_to_exchange)
+                        st.session_state["session_token"] = session_token
+                    st.success("Session exchanged successfully!")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Exchange failed: {ex}")
+            else:
+                st.warning("Please enter a token or URL first.")
+
+    # Connection Status
+    if st.session_state.get("session_token"):
+        st.success("● Connected to Breeze")
+        trunc_token = st.session_state["session_token"][:8] + "..." if len(st.session_state["session_token"]) > 10 else st.session_state["session_token"]
+        st.caption(f"Session Token: {trunc_token}")
+        if st.button("🚪 Disconnect Breeze", use_container_width=True):
+            st.session_state["session_token"] = None
+            st.rerun()
+    else:
+        st.warning("● Demo / Paper Mode Active")
+
     st.header("📅 Market setup")
     atm=st.number_input("ATM strike",1000.0,step=50.0,value=25000.0)
     strike_count=st.slider("Strikes",4,20,20)
@@ -243,7 +308,7 @@ with st.sidebar:
                 for k in strikes:
                     for right in ["call","put"]:
                         try:
-                            d0=get_hist(client.api_key,session,symbol,start_iso,end_iso,exp_iso,right,k,interval)
+                            d0=get_hist(client.api_key,client.secret_key,session,symbol,start_iso,end_iso,exp_iso,right,k,interval)
                             if not d0.empty: d0["strike"]=k; d0["right"]=right; frames.append(d0)
                         except Exception as ex: st.warning(f"{right.upper()} {k}: {ex}")
                 chain=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame(); times=sorted(chain.datetime.dropna().unique()) if not chain.empty else []
@@ -300,6 +365,9 @@ if out:
     view=pd.DataFrame(out).sort_values(["Strike","Right"])
 else:
     view=pd.DataFrame(columns=["Strike","Right","LTP","Volume","OI","IV %","Delta","Gamma","Theta","Vega","Rho"])
+
+# Define quotes for global use (e.g. exit/square-off actions)
+quotes = current_quotes(view)
 
 # Risk check
 if times:
