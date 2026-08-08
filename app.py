@@ -11,6 +11,30 @@ from greeks import implied_vol, greeks
 load_dotenv()
 st.set_page_config(page_title="Breeze Option Replay", page_icon="📈", layout="wide")
 
+def load_env_credentials():
+    api_key = os.getenv("BREEZE_API_KEY", "")
+    secret_key = os.getenv("BREEZE_SECRET_KEY", "")
+    if not api_key or not secret_key:
+        for filename in [".env", ".env.example"]:
+            if os.path.exists(filename):
+                try:
+                    with open(filename, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            if "=" in line:
+                                parts = line.split("=", 1)
+                                k = parts[0].strip()
+                                v = parts[1].strip().strip('"').strip("'")
+                                if k == "BREEZE_API_KEY" and not api_key:
+                                    api_key = v
+                                elif k == "BREEZE_SECRET_KEY" and not secret_key:
+                                    secret_key = v
+                except Exception:
+                    pass
+    return api_key, secret_key
+
 # ---------- helpers ----------
 def norm(rows):
     df = pd.DataFrame(rows)
@@ -212,13 +236,12 @@ if "autoplay" not in st.session_state:
 if "autoplay_speed" not in st.session_state:
     st.session_state.autoplay_speed = 1.0
 
-# 1. API Keys configuration from environment variables or session state
-api_key_env = os.getenv("BREEZE_API_KEY", "")
-secret_key_env = os.getenv("BREEZE_SECRET_KEY", "")
+# 1. API Keys configuration from environment variables, .env, or fallback .env.example
+api_key_env, secret_key_env = load_env_credentials()
 
-if "breeze_api_key" not in st.session_state:
+if "breeze_api_key" not in st.session_state or not st.session_state.breeze_api_key:
     st.session_state.breeze_api_key = api_key_env
-if "breeze_secret_key" not in st.session_state:
+if "breeze_secret_key" not in st.session_state or not st.session_state.breeze_secret_key:
     st.session_state.breeze_secret_key = secret_key_env
 
 with st.sidebar:
@@ -245,7 +268,13 @@ with st.sidebar:
         st.info("Demo mode works without credentials. Enter API credentials above to connect Breeze.")
 
     # Auto-exchange from query parameters
-    api_session = st.query_params.get("API_Session") or st.query_params.get("api_session")
+    # Capture any common parameter names returned by redirect URL: "api_session", "apisession", "API_Session", "session_token", "token"
+    api_session = None
+    for param_name in ["API_Session", "api_session", "apisession", "session_token", "token"]:
+        if param_name in st.query_params:
+            api_session = st.query_params[param_name]
+            break
+
     if api_session and client.configured:
         try:
             with st.spinner("Exchanging redirected session token..."):
