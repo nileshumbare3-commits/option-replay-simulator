@@ -8,6 +8,7 @@ from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
 from breeze_client import BreezeClient, format_breeze_date
 from greeks import implied_vol, greeks
+from backend.expiry_service import get_official_expiry_dates
 
 load_dotenv()
 st.set_page_config(page_title="Breeze Option Replay", page_icon="📈", layout="wide")
@@ -81,91 +82,6 @@ def payoff(legs, spots):
 def move_index(times, idx, delta):
     if not times: return idx
     return max(0,min(len(times)-1,idx+delta))
-
-# NSE Indian trading holidays (representative list for simulation)
-TRADING_HOLIDAYS = {
-    (1, 26),   # Republic Day
-    (5, 1),    # May Day
-    (8, 15),   # Independence Day
-    (10, 2),   # Gandhi Jayanti
-    (10, 24),  # Dussehra
-    (11, 14),  # Diwali
-    (12, 25),  # Christmas
-}
-
-def is_trading_holiday(d: date) -> bool:
-    if d.weekday() >= 5: # Saturday or Sunday
-        return True
-    if (d.month, d.day) in TRADING_HOLIDAYS:
-        return True
-    return False
-
-def shift_to_valid_trading_day(d: date) -> date:
-    while is_trading_holiday(d):
-        d = d - timedelta(days=1)
-    return d
-
-def get_last_thursday_of_month(year, month):
-    last_day_num = calendar.monthrange(year, month)[1]
-    last_day = date(year, month, last_day_num)
-    while last_day.weekday() != 3: # weekday 3 is Thursday
-        last_day -= timedelta(days=1)
-    return last_day
-
-def get_real_expiry_date_for_week(d, symbol):
-    # Find Monday of this week
-    monday = d - timedelta(days=d.weekday())
-
-    if symbol == "NIFTY":
-        thursday = monday + timedelta(days=3)
-        return shift_to_valid_trading_day(thursday)
-    elif symbol == "FINNIFTY":
-        tuesday = monday + timedelta(days=1)
-        return shift_to_valid_trading_day(tuesday)
-    elif symbol == "BANKNIFTY":
-        wednesday = monday + timedelta(days=2)
-        last_thu = get_last_thursday_of_month(wednesday.year, wednesday.month)
-
-        # If the last Thursday of the month falls in this week (Monday through Sunday)
-        if monday <= last_thu <= monday + timedelta(days=6):
-            return shift_to_valid_trading_day(last_thu)
-        else:
-            return shift_to_valid_trading_day(wednesday)
-    else:
-        thursday = monday + timedelta(days=3)
-        return shift_to_valid_trading_day(thursday)
-
-def get_expiry_dates(selected_day, symbol, client=None):
-    """
-    Expiry Selection with dynamic Broker Security Master sync and fallback.
-    - Exposes exactly up to 20 past and 20 future expiries dynamically.
-    """
-    if client and client.configured and st.session_state.get("session_token"):
-        try:
-            quotes = client.get_option_chain_quotes(symbol)
-            if quotes:
-                real_expiries = set()
-                for q in quotes:
-                    exp_str = q.get("expiry_date")
-                    if exp_str:
-                        # Parse ISO date safely
-                        d = datetime.strptime(exp_str.split("T")[0], "%Y-%m-%d").date()
-                        real_expiries.add(d)
-                if real_expiries:
-                    sorted_real = sorted(list(real_expiries))
-                    past = [d for d in sorted_real if d < selected_day][-20:]
-                    active_future = [d for d in sorted_real if d >= selected_day][:21]
-                    return sorted(past + active_future)
-        except Exception:
-            pass
-
-    # Dynamic weekday-shifted calendar fallback
-    expiries = []
-    for week_offset in range(-20, 21):
-        target_day_in_week = selected_day + timedelta(weeks=week_offset)
-        adjusted_expiry = get_real_expiry_date_for_week(target_day_in_week, symbol)
-        expiries.append(adjusted_expiry)
-    return sorted(list(set(expiries)))
 
 def get_spot_price(client, symbol, selected_day, selected_time, mode):
     if mode == "Demo":
@@ -613,8 +529,8 @@ with st.container(border=True):
 
     strike_count = m2.slider("Strikes", 4, 20, 20)
 
-    # Expiry is a selectbox dynamically calculated as 20 back / 20 forward weekly expiries
-    expiry_options = get_expiry_dates(selected_day, symbol, client)
+    # Expiry is a selectbox dynamically calculated directly from the Broker Security Master!
+    expiry_options = get_official_expiry_dates(selected_day, symbol, client)
 
     # Find active expiry (closest on or after selected_day)
     default_expiry_index = 0
