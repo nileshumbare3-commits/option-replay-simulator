@@ -475,28 +475,79 @@ with st.sidebar:
     else:
         st.info("Demo mode works without credentials. Enter API credentials above to connect Breeze.")
 
-    # Manual Session Token/Exchange
-    if client.configured:
-        manual_session = st.text_input("Manual API Session / Redirect URL", placeholder="Paste api_session or redirected URL")
-        if st.button("🔌 Exchange Session Token", use_container_width=True):
-            if manual_session:
-                token_to_exchange = manual_session
-                if "api_session=" in manual_session:
-                    try:
-                        token_to_exchange = manual_session.split("api_session=")[1].split("&")[0]
-                    except Exception:
-                        pass
-                try:
-                    with st.spinner("Exchanging manual token..."):
-                        session_token = client.exchange_api_session(token_to_exchange)
-                        st.session_state["session_token"] = session_token
-                    st.success("Session exchanged successfully!")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Exchange failed: {ex}")
-            else:
-                st.warning("Please enter a token or URL first.")
+   # ==============================================================================
+# 🚀 AUTOMATED SESSION TOKEN INTERCEPTOR & EXCHANGE
+# ==============================================================================
+# 1. Inspect URL Query Parameters automatically on page load/redirect
+query_params = st.query_params
 
+# Detect common session token parameter keys returned by Breeze/ICICI Direct
+session_keys = ["api_session", "API_Session", "apisession", "session_token", "token"]
+detected_raw_token = None
+
+for key in session_keys:
+    if key in query_params:
+        detected_raw_token = query_params[key]
+        break
+
+# 2. Perform automated token exchange if a new parameter is detected
+if detected_raw_token and not st.session_state.get("session_token"):
+    if client.configured:
+        try:
+            with st.spinner("⚡ Auto-authenticating: Exchanging Breeze session token..."):
+                # Clean token string if full URL or query parameters were passed
+                token_to_exchange = detected_raw_token
+                if "api_session=" in token_to_exchange:
+                    token_to_exchange = token_to_exchange.split("api_session=")[1].split("&")[0]
+
+                # Exchange session token with ICICI Direct Breeze API
+                session_token = client.exchange_api_session(token_to_exchange)
+                st.session_state["session_token"] = session_token
+                st.toast("✅ Breeze session authenticated successfully!", icon="🎉")
+
+            # Clear query parameters from URL to prevent infinite reload loops
+            st.query_params.clear()
+            st.rerun()
+        except Exception as ex:
+            st.error(f"Automated Session Exchange failed: {ex}")
+    else:
+        st.warning("Breeze API Keys not configured. Unable to exchange session token.")
+
+# 3. Fallback UI in Sidebar (Shows status & manual override option if needed)
+with st.sidebar:
+    if st.session_state.get("session_token"):
+        st.success("● Connected to Breeze")
+        trunc_token = (
+            st.session_state["session_token"][:8] + "..."
+            if len(st.session_state["session_token"]) > 10
+            else st.session_state["session_token"]
+        )
+        st.caption(f"Session Token: {trunc_token}")
+        if st.button("🚪 Disconnect Breeze", use_container_width=True):
+            st.session_state["session_token"] = None
+            st.rerun()
+    else:
+        # Optional manual paste fallback inside an expander
+        with st.expander("🛠️ Manual Token Exchange (Fallback)"):
+            manual_session = st.text_input("Paste Redirect URL / api_session", placeholder="https://localhost:8501/?api_session=...")
+            if st.button("🔌 Manual Exchange", use_container_width=True):
+                if manual_session:
+                    token_to_exchange = manual_session
+                    if "api_session=" in manual_session:
+                        try:
+                            token_to_exchange = manual_session.split("api_session=")[1].split("&")[0]
+                        except Exception:
+                            pass
+                    try:
+                        with st.spinner("Exchanging manual token..."):
+                            session_token = client.exchange_api_session(token_to_exchange)
+                            st.session_state["session_token"] = session_token
+                        st.success("Session exchanged successfully!")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Exchange failed: {ex}")
+                else:
+                    st.warning("Please enter a token or URL first.")
     # Connection Status
     if st.session_state.get("session_token"):
         st.success("● Connected to Breeze")
