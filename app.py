@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import calendar
 from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
 from breeze_client import BreezeClient
@@ -104,24 +105,48 @@ def shift_to_valid_trading_day(d: date) -> date:
         d = d - timedelta(days=1)
     return d
 
-def get_expiry_dates(selected_day, symbol):
-    if symbol == "FINNIFTY":
-        target_wd = 1  # Tuesday
+def get_last_thursday_of_month(year, month):
+    last_day_num = calendar.monthrange(year, month)[1]
+    last_day = date(year, month, last_day_num)
+    while last_day.weekday() != 3: # weekday 3 is Thursday
+        last_day -= timedelta(days=1)
+    return last_day
+
+def get_real_expiry_date_for_week(d, symbol):
+    # Find Monday of this week
+    monday = d - timedelta(days=d.weekday())
+
+    if symbol == "NIFTY":
+        # All expire on Thursdays
+        thursday = monday + timedelta(days=3)
+        return shift_to_valid_trading_day(thursday)
+    elif symbol == "FINNIFTY":
+        # All expire on Tuesdays
+        tuesday = monday + timedelta(days=1)
+        return shift_to_valid_trading_day(tuesday)
     elif symbol == "BANKNIFTY":
-        target_wd = 2  # Wednesday
+        # Weekly: Wednesday (Monday + 2 days)
+        # Monthly: Last Thursday of the month
+        wednesday = monday + timedelta(days=2)
+        last_thu = get_last_thursday_of_month(wednesday.year, wednesday.month)
+
+        # If the last Thursday of the month falls in this week (Monday through Sunday)
+        if monday <= last_thu <= monday + timedelta(days=6):
+            return shift_to_valid_trading_day(last_thu)
+        else:
+            return shift_to_valid_trading_day(wednesday)
     else:
-        target_wd = 3  # Thursday
+        # Default Thursday
+        thursday = monday + timedelta(days=3)
+        return shift_to_valid_trading_day(thursday)
 
-    current_wd = selected_day.weekday()
-    days_to_expiry = (target_wd - current_wd) % 7
-    anchor_date = selected_day + timedelta(days=days_to_expiry)
-
+def get_expiry_dates(selected_day, symbol):
     expiries = []
     # Dynamic selection across exactly 20 back and 20 forward weekly expiries
     for week_offset in range(-20, 21):
-        raw_date = anchor_date + timedelta(weeks=week_offset)
-        adjusted_date = shift_to_valid_trading_day(raw_date)
-        expiries.append(adjusted_date)
+        target_day_in_week = selected_day + timedelta(weeks=week_offset)
+        adjusted_expiry = get_real_expiry_date_for_week(target_day_in_week, symbol)
+        expiries.append(adjusted_expiry)
     return sorted(list(set(expiries)))
 
 def get_spot_price(client, symbol, selected_day, selected_time, mode):
