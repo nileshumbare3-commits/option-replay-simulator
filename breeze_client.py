@@ -35,3 +35,26 @@ class BreezeClient:
                        headers={'X-SessionToken':self.session_token,'X-apikey':self.api_key},timeout=30)
         r.raise_for_status()
         return r.json().get('Success',[])
+
+    def historical(self, stock_code, exchange_code, product_type, from_date, to_date, interval='1minute', expiry_date=None, right=None, strike_price=None):
+        if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
+        params = {
+            'interval': interval,
+            'from_date': from_date,
+            'to_date': to_date,
+            'stock_code': stock_code,
+            'exchange_code': exchange_code,
+            'product_type': product_type.lower() if product_type else None
+        }
+        params['exch_code'] = exchange_code
+        if expiry_date:
+            params['expiry_date'] = expiry_date
+        if right:
+            params['right'] = right.lower()
+        if strike_price is not None:
+            params['strike_price'] = str(strike_price)
+        params = {k: v for k, v in params.items() if v is not None}
+        r = requests.get(self.HISTORICAL_URL, params=params,
+                       headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
+        r.raise_for_status()
+        return r.json().get('Success', [])
