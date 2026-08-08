@@ -6,7 +6,7 @@ import logging
 import os
 import time
 import zipfile
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import pandas as pd
@@ -110,6 +110,21 @@ class BreezeClient:
         return payload.get("Success", [])
 
     @staticmethod
+    def build_feed_params(stock_code, expiry_date, strike_price, right, interval=None, exchange_code="NFO", product_type="options"):
+        """Normalize parameters for Breeze subscribe_feeds-style helpers."""
+        params = {
+            "exchange_code": exchange_code,
+            "stock_code": stock_code,
+            "expiry_date": format_breeze_date(expiry_date, "FEED_EXCHANGE"),
+            "strike_price": format_strike_price(strike_price),
+            "right": normalize_right(right, websocket=True),
+            "product_type": product_type,
+        }
+        if interval:
+            params["interval"] = interval
+        return params
+
+    @staticmethod
     def _find_column(columns, names):
         normalized = {str(c).strip().lower().replace(" ", "_"): c for c in columns}
         for name in names:
@@ -124,7 +139,7 @@ class BreezeClient:
                 if not name.lower().endswith((".csv", ".txt")):
                     continue
                 with archive.open(name) as fh:
-                    for sep in [",", "|", "\\t"]:
+                    for sep in [",", "|", "\t"]:
                         fh.seek(0)
                         try:
                             df = pd.read_csv(fh, sep=sep, dtype=str, low_memory=False)
@@ -157,11 +172,10 @@ class BreezeClient:
                     logger.debug("Ignoring unparseable security-master expiry: %r", value)
         return sorted(expiries)
 
-    def expiry_calendar(self, stock_code, today=None):
+    def expiry_calendar(self, stock_code):
         """Read actual NFO contract expiries from the broker's daily Security Master."""
         if not self.api_key or not self.session_token:
             raise RuntimeError("Complete Breeze login first")
-        today = today or datetime.now(timezone.utc).date()
         try:
             r = requests.get(self.SECURITY_MASTER_URL, timeout=self.timeout)
             r.raise_for_status()
@@ -172,7 +186,6 @@ class BreezeClient:
         except Exception as exc:
             logger.warning("Security Master sync failed for %s: %s", stock_code, exc)
 
-        # Public stock-script CSV is a documented secondary source for contract/token data.
         try:
             r = requests.get(self.STOCK_SCRIPT_CSV_URL, timeout=self.timeout)
             r.raise_for_status()
