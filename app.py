@@ -3,9 +3,10 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from datetime import date, time, datetime, timedelta
+from datetime import date, time, datetime, timedelta, timezone
 from dotenv import load_dotenv
 from breeze_client import BreezeClient
+from breeze_dates import format_breeze_date
 from greeks import implied_vol, greeks
 
 load_dotenv()
@@ -24,6 +25,18 @@ def norm(rows):
 def get_hist(api_key, session, symbol, start, end, expiry, right, strike, interval):
     c = BreezeClient(api_key=api_key, secret_key=os.getenv("BREEZE_SECRET_KEY"), session_token=session)
     return norm(c.historical_option(symbol, start, end, expiry, right, strike, interval))
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_expiry_calendar(api_key, session, symbol):
+    c = BreezeClient(api_key=api_key, secret_key=os.getenv("BREEZE_SECRET_KEY"), session_token=session)
+    return c.expiry_calendar(symbol)
+
+def expiry_window(expiries, reference=None):
+    reference = reference or date.today()
+    dates = sorted({pd.Timestamp(x).date() for x in expiries})
+    past = [x for x in dates if x < reference][-20:]
+    future = [x for x in dates if x >= reference][:20]
+    return past + future
 
 def demo_chain(atm, step, count, day):
     rng=np.random.default_rng(7)
@@ -97,12 +110,29 @@ with st.sidebar:
         try:
             st.session_state["session_token"]=client.exchange_api_session(api_session); st.query_params.clear()
         except Exception as ex: st.error(str(ex))
-    st.success("● Breeze connected" if st.session_state.get("session_token") else "● Demo / Paper")
+    session=st.session_state.get("session_token")
+    st.success("● Breeze connected" if session else "● Demo / Paper")
     st.header("📅 Market setup")
     atm=st.number_input("ATM strike",1000.0,step=50.0,value=25000.0)
     strike_count=st.slider("Strikes",4,20,20)
-    # Expiry is intentionally a separate control; Breeze mode can later be wired to expiry discovery.
-    expiry_date=st.date_input("Option expiry",date(2026,8,13))
+
+    expiry_choices=[]
+    if mode == "Breeze" and session:
+        try:
+            synced_expiries=get_expiry_calendar(client.api_key,session,symbol)
+            expiry_choices=expiry_window(synced_expiries)
+            if expiry_choices:
+                st.caption(f"Broker-synced contracts: {len(expiry_choices)} (20 past + 20 future max)")
+                expiry_date=st.selectbox("Option expiry",expiry_choices,format_func=lambda d: format_breeze_date(d,"DISPLAY_FORMAT"))
+            else:
+                st.error("No traded NFO expiries returned by Security Master.")
+                expiry_date=date.today()
+        except Exception as ex:
+            st.error(f"Expiry sync failed: {ex}")
+            expiry_date=date.today()
+    else:
+        expiry_date=st.date_input("Option expiry (demo)",date(2026,8,13))
+
     expiry_time=st.time_input("Expiry time",time(15,30))
     rate=st.number_input("Risk-free %",6.5,step=.25)/100
     div=st.number_input("Dividend %",0.0,step=.25)/100
@@ -114,16 +144,17 @@ with st.sidebar:
             frames=[]; strikes=sorted(round(atm+(i-strike_count//2)*step,2) for i in range(strike_count))
             if not session: st.error("Connect Breeze first."); chain,times=pd.DataFrame(),[]
             else:
-                start_iso=f"{selected_day}T09:15:00.000Z"; end_iso=f"{selected_day}T15:30:00.000Z"; exp_iso=f"{expiry_date}T{expiry_time.strftime('%H:%M:%S')}.000Z"
+                start_dt=datetime.combine(selected_day,time(9,15),tzinfo=timezone.utc)
+                end_dt=datetime.combine(selected_day,time(15,30),tzinfo=timezone.utc)
+                expiry_dt=datetime.combine(expiry_date,expiry_time,tzinfo=timezone.utc)
                 for k in strikes:
                     for right in ["call","put"]:
                         try:
-                            d0=get_hist(client.api_key,session,symbol,start_iso,end_iso,exp_iso,right,k,interval)
+                            d0=get_hist(client.api_key,session,symbol,start_dt,end_dt,expiry_dt,right,k,interval)
                             if not d0.empty: d0["strike"]=k; d0["right"]=right; frames.append(d0)
                         except Exception as ex: st.warning(f"{right.upper()} {k}: {ex}")
                 chain=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame(); times=sorted(chain.datetime.dropna().unique()) if not chain.empty else []
         st.session_state.chain=chain; st.session_state.times=times
-        # select nearest available timestamp to requested time
         target=pd.Timestamp(datetime.combine(selected_day,selected_time))
         if times: st.session_state.idx=int(np.argmin([abs(pd.Timestamp(x)-target) for x in times]))
         st.session_state.mtm_history=[]
@@ -135,7 +166,6 @@ idx=min(st.session_state.get("idx",0),len(times)-1)
 
 # ---------- replay jumps ----------
 jump_options={"1 min":1,"5 min":1,"30 min":6,"1 hour":12,"3 hours":36,"1 day":78}
-# indices are based on the generated 5-minute replay; for other intervals we use the nearest bar.
 with st.container(border=True):
     j1,j2,j3,j4,j5,j6,j7=st.columns(7)
     if j1.button("⏮ 1m"): st.session_state.idx=move_index(times,idx,-max(1,1)); st.rerun()
@@ -154,7 +184,6 @@ with st.container(border=True):
     if q4.button("➡ 1 day",use_container_width=True): st.session_state.idx=move_index(times,idx,78); st.rerun()
 
 idx=min(st.session_state.idx,len(times)-1); snap=chain[chain.datetime==times[idx]].copy()
-# use the simulated spot if available; otherwise ATM input
 spot=float(snap["spot"].iloc[0]) if "spot" in snap.columns and not snap.empty else float(atm)
 expiry_dt=pd.Timestamp(datetime.combine(expiry_date,expiry_time),tz="UTC")
 rt=pd.Timestamp(times[idx]); rt=rt.tz_localize("UTC") if rt.tzinfo is None else rt.tz_convert("UTC")
@@ -176,13 +205,10 @@ for strike in sorted(view.Strike.unique()):
     cols=st.columns([.8,1,1,1,1,1,1,1,1,1,1])
     cols[0].markdown(f"**{strike:,.0f}**")
     if ce is not None:
-        cols[1].markdown(f"₹{ce.LTP:.2f}")
-        cols[2].markdown(f"{ce['IV %']:.1f}%")
-        cols[3].markdown(f"{ce.Delta:.3f}"); cols[4].markdown(f"{ce.Gamma:.4f}"); cols[5].markdown(f"{ce.Theta:.3f}")
+        cols[1].markdown(f"₹{ce.LTP:.2f}"); cols[2].markdown(f"{ce['IV %']:.1f}%"); cols[3].markdown(f"{ce.Delta:.3f}"); cols[4].markdown(f"{ce.Gamma:.4f}"); cols[5].markdown(f"{ce.Theta:.3f}")
     if pe is not None:
         cols[6].markdown(f"₹{pe.LTP:.2f}"); cols[7].markdown(f"{pe['IV %']:.1f}%"); cols[8].markdown(f"{pe.Delta:.3f}"); cols[9].markdown(f"{pe.Gamma:.4f}"); cols[10].markdown(f"{pe.Theta:.3f}")
-    bcols=st.columns([.8,1,1,1,1,1,1,1,1,1,1])
-    bcols[0].caption("paper")
+    bcols=st.columns([.8,1,1,1,1,1,1,1,1,1,1]); bcols[0].caption("paper")
     if ce is not None:
         if bcols[1].button("BUY CE",key=f"bce{strike}"): st.session_state.order_request=("BUY","CALL",float(strike),float(ce.LTP)); st.rerun()
         if bcols[2].button("SELL CE",key=f"sce{strike}"): st.session_state.order_request=("SELL","CALL",float(strike),float(ce.LTP)); st.rerun()
@@ -216,16 +242,13 @@ if st.session_state.get("order_request"):
 portfolio,pos_value=mark_portfolio(view)
 mtm=pos_value + st.session_state.cash - 1_000_000.0
 st.session_state.mtm_history.append({"time":pd.Timestamp(times[idx]),"mtm":mtm})
-# de-duplicate replay points
 mh=pd.DataFrame(st.session_state.mtm_history).drop_duplicates("time").sort_values("time")
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric("Replay time",pd.Timestamp(times[idx]).strftime("%d %b %Y %H:%M")); m2.metric("MTM P&L",f"₹{mtm:,.2f}"); m3.metric("Cash",f"₹{st.session_state.cash:,.2f}"); m4.metric("Open positions",str(len(st.session_state.positions)))
 
 if not mh.empty:
-    mtm_fig=go.Figure(go.Scatter(x=mh.time,y=mh.mtm,mode="lines+markers",name="MTM P&L",fill="tozeroy"))
-    mtm_fig.add_hline(y=0,line_dash="dot"); mtm_fig.update_layout(height=330,title="MTM fluctuation over replay time",xaxis_title="Replay time",yaxis_title="P&L (₹)")
-    st.plotly_chart(mtm_fig,use_container_width=True)
+    mtm_fig=go.Figure(go.Scatter(x=mh.time,y=mh.mtm,mode="lines+markers",name="MTM P&L",fill="tozeroy")); mtm_fig.add_hline(y=0,line_dash="dot"); mtm_fig.update_layout(height=330,title="MTM fluctuation over replay time",xaxis_title="Replay time",yaxis_title="P&L (₹)"); st.plotly_chart(mtm_fig,use_container_width=True)
 
 # ---------- position management ----------
 st.subheader("💼 Open Positions — close anytime")
