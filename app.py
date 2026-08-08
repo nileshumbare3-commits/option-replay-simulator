@@ -131,6 +131,23 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
             st.warning(f"Failed to fetch auto-spot price from Breeze: {e}. Using fallback.")
         return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
 
+def get_strike_position_info(strike, right):
+    # right is "CALL" or "PUT"
+    active_positions = st.session_state.get("positions", [])
+    net_qty = 0
+    buys = 0
+    sells = 0
+    for p in active_positions:
+        if p["strike"] == float(strike) and p["right"].upper() == right.upper():
+            q = p["qty"]
+            if p["side"] == "BUY":
+                net_qty += q
+                buys += q
+            else:
+                net_qty -= q
+                sells += q
+    return net_qty, buys, sells
+
 import uuid
 
 def current_quotes(view):
@@ -547,6 +564,23 @@ tab_terminal, tab_positions = st.tabs(["📊 Option Terminal & Strategy Builder"
 
 # ---------- TAB 1: Option Terminal & Strategy Builder ----------
 with tab_terminal:
+    # Beautiful top-aligned simulation status card with full formatted datetime
+    if times:
+        session_ts = pd.Timestamp(times[idx])
+        formatted_session_time = session_ts.strftime("%d-%b-%Y %I:%M %p")
+        st.markdown(f"""
+        <div style='background-color: #0f172a; padding: 15px 25px; border-radius: 8px; border: 1.5px solid #1e293b; margin-bottom: 25px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);'>
+            <div>
+                <div style='font-size: 0.8rem; font-weight: bold; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em;'>⏱ ACTIVE REPLAY SESSION</div>
+                <div style='font-size: 1.5rem; font-weight: 800; color: #38bdf8;'>{symbol} Option Chain</div>
+            </div>
+            <div style='text-align: right;'>
+                <div style='font-size: 0.8rem; font-weight: bold; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em;'>CURRENT SIMULATION TIMESTAMP</div>
+                <div style='font-size: 1.5rem; font-weight: 800; color: #4ade80; font-family: monospace;'>{formatted_session_time}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     # Option Chain Section
     st.subheader("📈 Interactive Option Chain")
     st.caption("Execute trades instantly. You can set individual Stop-Loss (SL) and Take-Profit (TP) percentages before buying or selling.")
@@ -566,6 +600,13 @@ with tab_terminal:
     for strike in sorted(view.Strike.unique()):
         ce=view[(view.Strike==strike)&(view.Right=="CALL")]; pe=view[(view.Strike==strike)&(view.Right=="PUT")]
         ce=ce.iloc[0] if not ce.empty else None; pe=pe.iloc[0] if not pe.empty else None
+
+        # Calculate positions
+        ce_net, ce_b, ce_s = get_strike_position_info(strike, "CALL")
+        pe_net, pe_b, pe_s = get_strike_position_info(strike, "PUT")
+
+        ce_is_itm = (strike < spot)
+        pe_is_itm = (strike > spot)
 
         cols = st.columns([1, 1.2, 1.2, 1.2, 1.2, 1.2, 1, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2])
 
@@ -620,19 +661,45 @@ with tab_terminal:
                 })
                 st.rerun()
 
-            cols[2].markdown(f"<div style='text-align: center;'>₹{ce.LTP:.2f}</div>", unsafe_allow_html=True)
+            # CE LTP cell styling with dynamic In-The-Money highlighting & net quantity display
+            if ce_is_itm:
+                ce_ltp_html = f"<div style='text-align: center; background-color: #fbbf2415; border: 1px solid #fbbf2440; border-radius: 4px; padding: 2px 5px;'><span style='color: #fbbf24; font-weight: bold;'>₹{ce.LTP:.2f}</span> <span style='font-size: 0.75rem; background-color: #fbbf242c; padding: 2px 4px; border-radius: 3px; color: #fbbf24; font-weight: bold;'>ITM</span></div>"
+            else:
+                ce_ltp_html = f"<div style='text-align: center; color: #e2e8f0;'>₹{ce.LTP:.2f}</div>"
+
+            if ce_net > 0:
+                ce_ltp_html += f"<div style='text-align: center; color: #4ade80; font-size: 0.8rem; font-weight: bold; margin-top: 3px;'>🟢 Long: {ce_net}</div>"
+            elif ce_net < 0:
+                ce_ltp_html += f"<div style='text-align: center; color: #f87171; font-size: 0.8rem; font-weight: bold; margin-top: 3px;'>🔴 Short: {abs(ce_net)}</div>"
+
+            cols[2].markdown(ce_ltp_html, unsafe_allow_html=True)
             cols[3].markdown(f"<div style='text-align: center;'>{ce['IV %']:.1f}%</div>", unsafe_allow_html=True)
             cols[4].markdown(f"<div style='text-align: center;'>{ce.Delta:.2f}</div>", unsafe_allow_html=True)
             cols[5].markdown(f"<div style='text-align: center;'>{ce.Theta:.1f}</div>", unsafe_allow_html=True)
         else:
             for i in range(6): cols[i].write("")
 
-        # Strike Center
-        cols[6].markdown(f"<div style='text-align: center; font-weight: bold; background-color: #1e293b; padding: 2px 5px; border-radius: 4px;'>{strike:,.0f}</div>", unsafe_allow_html=True)
+        # Strike Center styled with clean font color and prominent highlight for high contrast readability
+        # If strike is nearest ATM, highlight with bright green outline
+        if abs(strike - spot) <= step * 0.51:
+            cols[6].markdown(f"<div style='text-align: center; font-weight: bold; background-color: #020617; border: 2.5px solid #22c55e; padding: 2px 5px; border-radius: 4px; color: #38bdf8; font-size: 1.1rem; box-shadow: 0 0 10px #22c55e40;'>{strike:,.0f}</div>", unsafe_allow_html=True)
+        else:
+            cols[6].markdown(f"<div style='text-align: center; font-weight: bold; background-color: #1e293b; border: 1px solid #475569; padding: 2px 5px; border-radius: 4px; color: #38bdf8; font-size: 1.0rem;'>{strike:,.0f}</div>", unsafe_allow_html=True)
 
         # PE buttons
         if pe is not None:
-            cols[7].markdown(f"<div style='text-align: center;'>₹{pe.LTP:.2f}</div>", unsafe_allow_html=True)
+            # PE LTP cell styling with dynamic In-The-Money highlighting & net quantity display
+            if pe_is_itm:
+                pe_ltp_html = f"<div style='text-align: center; background-color: #c084fc15; border: 1px solid #c084fc40; border-radius: 4px; padding: 2px 5px;'><span style='color: #c084fc; font-weight: bold;'>₹{pe.LTP:.2f}</span> <span style='font-size: 0.75rem; background-color: #c084fc2c; padding: 2px 4px; border-radius: 3px; color: #c084fc; font-weight: bold;'>ITM</span></div>"
+            else:
+                pe_ltp_html = f"<div style='text-align: center; color: #e2e8f0;'>₹{pe.LTP:.2f}</div>"
+
+            if pe_net > 0:
+                pe_ltp_html += f"<div style='text-align: center; color: #4ade80; font-size: 0.8rem; font-weight: bold; margin-top: 3px;'>🟢 Long: {pe_net}</div>"
+            elif pe_net < 0:
+                pe_ltp_html += f"<div style='text-align: center; color: #f87171; font-size: 0.8rem; font-weight: bold; margin-top: 3px;'>🔴 Short: {abs(pe_net)}</div>"
+
+            cols[7].markdown(pe_ltp_html, unsafe_allow_html=True)
             cols[8].markdown(f"<div style='text-align: center;'>{pe['IV %']:.1f}%</div>", unsafe_allow_html=True)
             cols[9].markdown(f"<div style='text-align: center;'>{pe.Delta:.2f}</div>", unsafe_allow_html=True)
             cols[10].markdown(f"<div style='text-align: center;'>{pe.Theta:.1f}</div>", unsafe_allow_html=True)
