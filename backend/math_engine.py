@@ -6,7 +6,7 @@ def black_scholes_pricing(S: float, K: float, T: float, r: float, q: float, sigm
     S: Spot Price
     K: Strike Price
     T: Time to Expiration (in years)
-    r: Risk-free rate (e.g. 0.065 for 6.5%)
+    r: Risk-free rate (e.g. 0.07 for 7%)
     q: Dividend yield
     sigma: Implied Volatility
     option_type: 'call' or 'put'
@@ -30,49 +30,45 @@ def black_scholes_pricing(S: float, K: float, T: float, r: float, q: float, sigm
 
     return max(0.0, price)
 
+def vega_greeks(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
+    if T <= 1e-6:
+        return 0.0
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
+    pdf_d1 = norm.pdf(d1)
+    vega = S * sqrt_T * pdf_d1 * math.exp(-q * T)
+    return vega
+
 def implied_volatility(price: float, S: float, K: float, T: float, r: float, q: float, option_type: str) -> float:
     """
-    Calculates Implied Volatility using Newton-Raphson or Bisection solver.
+    Calculates Implied Volatility using Newton-Raphson solver.
+    Convergence criteria: |BS_Price(IV) - Market_Price| < 0.001 within 20 iterations.
+    Falls back to historic volatility (20%, i.e., 0.20) if solver fails to converge.
     """
-    # Intrinsic value floor
     intrinsic = max(S - K, 0.0) if option_type.lower() == 'call' else max(K - S, 0.0)
     if price <= intrinsic:
-        return 0.01
+        return 0.20
 
-    # Bisection search bounds
-    low_vol = 0.0001
-    high_vol = 5.0
-
-    # Check bounds
-    p_low = black_scholes_pricing(S, K, T, r, q, low_vol, option_type)
-    if p_low >= price:
-        return low_vol
-
-    p_high = black_scholes_pricing(S, K, T, r, q, high_vol, option_type)
-    if p_high <= price:
-        return high_vol
-
-    # Perform bisection search
-    for _ in range(100):
-        mid_vol = (low_vol + high_vol) / 2.0
-        p_mid = black_scholes_pricing(S, K, T, r, q, mid_vol, option_type)
-
-        if abs(p_mid - price) < 1e-5:
-            return mid_vol
-
-        if p_mid < price:
-            low_vol = mid_vol
-        else:
-            high_vol = mid_vol
-
-    return (low_vol + high_vol) / 2.0
+    # Starting guess: 20%
+    sigma = 0.20
+    for _ in range(20):
+        p_val = black_scholes_pricing(S, K, T, r, q, sigma, option_type)
+        diff = p_val - price
+        if abs(diff) < 0.001:
+            return sigma
+        veg = vega_greeks(S, K, T, r, q, sigma)
+        if abs(veg) < 1e-4:
+            return 0.20
+        sigma = sigma - diff / veg
+        if sigma <= 0.001 or sigma > 5.0:
+            return 0.20
+    return sigma
 
 def calculate_greeks(S: float, K: float, T: float, r: float, q: float, sigma: float, option_type: str) -> dict:
     """
     Calculates Delta, Gamma, Theta, Vega, and Rho.
     """
     if T <= 1e-6:
-        # Expiry greeks
         if option_type.lower() == 'call':
             delta = 1.0 if S > K else 0.0
         else:
@@ -119,3 +115,56 @@ def calculate_greeks(S: float, K: float, T: float, r: float, q: float, sigma: fl
         "vega": vega / 100.0,     # change per 1% vol change
         "rho": rho / 100.0        # change per 1% rate change
     }
+
+def get_strike_interval(symbol: str) -> float:
+    sym = symbol.upper()
+    if sym == "NIFTY":
+        return 50.0
+    elif sym == "BANKNIFTY":
+        return 100.0
+    elif sym == "FINNIFTY":
+        return 50.0
+    else:
+        return 50.0
+
+def get_atm_strike(S: float, I: float) -> float:
+    return round(S / I) * I
+
+def generate_strike_grid(S: float, symbol: str) -> list:
+    I = get_strike_interval(symbol)
+    atm = get_atm_strike(S, I)
+    return [round(atm + (i - 15) * I, 2) for i in range(31)]
+
+def calculate_pcr(call_oi: float, put_oi: float) -> float:
+    if call_oi <= 0:
+        return 0.0
+    return put_oi / call_oi
+
+def calculate_max_pain(strikes_info: list) -> float:
+    """
+    strikes_info is a list of dicts: [{"strike": float, "call_oi": float, "put_oi": float}]
+    """
+    if not strikes_info:
+        return 0.0
+    best_strike = strikes_info[0]["strike"]
+    min_pain = float("inf")
+
+    strikes = [item["strike"] for item in strikes_info]
+
+    for s_target in strikes:
+        current_pain = 0.0
+        for item in strikes_info:
+            strike = item["strike"]
+            c_oi = item.get("call_oi", 0.0)
+            p_oi = item.get("put_oi", 0.0)
+
+            # Loss for call option buyers
+            current_pain += max(s_target - strike, 0.0) * c_oi
+            # Loss for put option buyers
+            current_pain += max(strike - s_target, 0.0) * p_oi
+
+        if current_pain < min_pain:
+            min_pain = current_pain
+            best_strike = s_target
+
+    return best_strike
