@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 
+from breeze_client import BreezeClient
 from breeze_dates import format_breeze_date, format_strike_price, normalize_right
 
 
@@ -27,3 +28,10 @@ def test_right_normalization():
     assert normalize_right("put") == "put"
     assert normalize_right("call", websocket=True) == "Call"
     assert normalize_right("PUT", websocket=True) == "Put"
+
+
+def test_feed_params_match_breeze_stream_format():
+    params = BreezeClient.build_feed_params("NIFTY", date(2026, 7, 28), 24500.0, "call", interval="1minute")
+    assert params["expiry_date"] == "28-Jul-2026"
+    assert params["strike_price"] == "24500"
+    assert params["right"] == "Call"
