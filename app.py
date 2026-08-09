@@ -19,85 +19,13 @@ from backend.expiry_service import (
 # Load environment variables
 load_dotenv()
 
-# Streamlit config
+# Streamlit page configuration
 st.set_page_config(
     page_title="StockMock Options Simulator",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# Custom premium styling (StockMock style)
-st.markdown("""
-<style>
-/* CSS styles to clean up container spacing and styling */
-.block-container {
-    padding-top: 1rem;
-    padding-bottom: 2rem;
-    max-width: 1800px;
-}
-div.stButton > button:first-child {
-    transition: all 0.15s ease-in-out;
-}
-div.stButton > button:first-child:hover {
-    transform: translateY(-1px);
-}
-div[data-testid="stTextInput"]:has(input[placeholder="HiddenTradeSignalInput"]) {
-    display: none !important;
-}
-.metric-card {
-    background-color: #0f172a;
-    border: 1px solid #1e293b;
-    border-radius: 6px;
-    padding: 10px 15px;
-    text-align: center;
-}
-.metric-title {
-    font-size: 0.75rem;
-    color: #94a3b8;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-}
-.metric-value {
-    font-size: 1.25rem;
-    font-weight: 700;
-}
-.tag-green {
-    background-color: rgba(34, 197, 94, 0.15);
-    color: #22c55e;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: bold;
-}
-.tag-red {
-    background-color: rgba(239, 68, 68, 0.15);
-    color: #ef4444;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: bold;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# PostMessage communication listener for interactive hover option chain
-st.markdown("""
-<script>
-window.addEventListener("message", (event) => {
-    const actionStr = event.data;
-    if (typeof actionStr === "string" && (actionStr.startsWith("BUY:") || actionStr.startsWith("SELL:") || actionStr.startsWith("DESELECT:"))) {
-        const input = window.parent.document.querySelector('input[placeholder="HiddenTradeSignalInput"]');
-        if (input) {
-            input.value = actionStr;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-    }
-});
-</script>
-""", unsafe_allow_html=True)
 
 # ----------------- SESSION STATE INITIALIZATION -----------------
 if "positions" not in st.session_state:
@@ -108,8 +36,6 @@ if "trade_history" not in st.session_state:
     st.session_state.trade_history = []
 if "mtm_history" not in st.session_state:
     st.session_state.mtm_history = []
-if "strategy_legs" not in st.session_state:
-    st.session_state.strategy_legs = []
 if "autoplay" not in st.session_state:
     st.session_state.autoplay = False
 if "autoplay_speed" not in st.session_state:
@@ -120,12 +46,25 @@ if "replay_time" not in st.session_state:
     st.session_state.replay_time = time(9, 15)
 if "active_expiry_date" not in st.session_state:
     st.session_state.active_expiry_date = None
+if "expiry_page_start" not in st.session_state:
+    st.session_state.expiry_page_start = 0
 if "selected_rows" not in st.session_state:
     st.session_state.selected_rows = set()
 if "multiplier" not in st.session_state:
     st.session_state.multiplier = 1
+if "last_quotes" not in st.session_state:
+    st.session_state.last_quotes = {}
 
-# Helper to load credential fallback
+# Helper to get lot size for each index
+def get_lot_size(symbol_name: str) -> int:
+    sym = symbol_name.upper().strip()
+    if "BANK" in sym:
+        return 30
+    elif "FIN" in sym:
+        return 40
+    return 65
+
+# Helper to load API credential fallback
 def load_env_credentials():
     api_key = os.getenv("BREEZE_API_KEY", "")
     secret_key = os.getenv("BREEZE_SECRET_KEY", "")
@@ -178,6 +117,52 @@ if api_session and client.configured:
         st.rerun()
     except Exception as ex:
         st.error(f"Auto-exchange failed: {ex}")
+
+# ----------------- SIDELINED INTERACTION DISPATCHER (QUERY-PARAM BRIDGE) -----------------
+# Captures and executes paper orders immediately with exact lot sizes and updates state cleanly
+if "action" in st.query_params:
+    action_val = st.query_params["action"]
+    parts = action_val.split(":")
+    if len(parts) == 3:
+        cmd, right_str, strike_str = parts
+        strike_val = float(strike_str)
+        right_val = right_str.upper()
+        symbol_param = st.query_params.get("symbol_name", "NIFTY")
+        qty_step = get_lot_size(symbol_param)
+
+        if cmd == "DESELECT":
+            st.session_state.positions = [p for p in st.session_state.positions if not (p["strike"] == strike_val and p["right"].upper() == right_val)]
+            st.toast(f"Deselected {right_val} {strike_val}", icon="🗑️")
+        elif cmd in ["BUY", "SELL"]:
+            match = None
+            for p in st.session_state.positions:
+                if p["strike"] == strike_val and p["right"].upper() == right_val and p["side"].upper() == cmd:
+                    match = p
+                    break
+
+            # Fetch current ltp from active quotes
+            ltp_val = 100.0
+            if "last_quotes" in st.session_state and (right_val, strike_val) in st.session_state.last_quotes:
+                ltp_val = st.session_state.last_quotes[(right_val, strike_val)]
+
+            if match:
+                match["qty"] += qty_step
+            else:
+                st.session_state.positions.append({
+                    "id": str(uuid.uuid4()),
+                    "right": right_val,
+                    "strike": strike_val,
+                    "side": cmd,
+                    "qty": qty_step,
+                    "avg": ltp_val,
+                    "sl_pct": None,
+                    "tp_pct": None,
+                    "entry_time": str(st.session_state.replay_time)
+                })
+            st.toast(f"Executed Order: {cmd} {right_val} {strike_val} (+{qty_step} Qty) @ ₹{ltp_val:.2f}", icon="🛒")
+
+    st.query_params.clear()
+    st.rerun()
 
 # ----------------- SIDEBAR: LOGIN & SETUP -----------------
 with st.sidebar:
@@ -313,16 +298,11 @@ def adjust_replay_time(minutes_delta: int):
 st.title("🛡️ StockMock Options Simulator")
 st.caption("Professional Full-Stack Options Trading Replay Dashboard")
 
-# Top Control Bar layout
-bar_col1, bar_col2, bar_col3 = st.columns([1.5, 6.5, 2.0])
+# Top Control Bar layout with exactly 16 columns for perfect alignment
+with st.container():
+    nav_cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1.8, 1.8, 1, 1, 1, 1, 1, 1, 1])
 
-with bar_col1:
-    symbol = st.selectbox("Underlying Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], label_visibility="collapsed")
-    mode = st.selectbox("Data mode", ["Demo", "Breeze"], index=0, label_visibility="collapsed")
-
-with bar_col2:
-    # 15 navigation buttons
-    nav_cols = st.columns(14)
+    # Left controls
     if nav_cols[0].button("<< Day", use_container_width=True):
         st.session_state.replay_date -= timedelta(days=1)
         st.rerun()
@@ -349,6 +329,7 @@ with bar_col2:
     st.session_state.replay_date = nav_cols[7].date_input("Date", st.session_state.replay_date, label_visibility="collapsed")
     st.session_state.replay_time = nav_cols[8].time_input("Time", st.session_state.replay_time, label_visibility="collapsed")
 
+    # Right controls
     if nav_cols[9].button("+1m", use_container_width=True):
         adjust_replay_time(1)
         st.rerun()
@@ -364,8 +345,20 @@ with bar_col2:
     if nav_cols[13].button("+2h", use_container_width=True):
         adjust_replay_time(120)
         st.rerun()
+    if nav_cols[14].button("EOD", use_container_width=True):
+        st.session_state.replay_time = time(15, 30)
+        st.rerun()
+    if nav_cols[15].button("Day >>", use_container_width=True):
+        st.session_state.replay_date += timedelta(days=1)
+        st.rerun()
 
-with bar_col3:
+# Sub-bar for Symbol, Data mode and Autoplay Controls
+sub_col1, sub_col2, sub_col3, sub_col4 = st.columns([1.5, 1.5, 4.0, 3.0])
+with sub_col1:
+    symbol = st.selectbox("Underlying Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], label_visibility="collapsed")
+with sub_col2:
+    mode = st.selectbox("Data mode", ["Demo", "Breeze"], index=0, label_visibility="collapsed")
+with sub_col3:
     col_play, col_snap = st.columns([1.2, 0.8])
     with col_play:
         ap_label = "🔴 Stop Run" if st.session_state.autoplay else "🟢 Auto Run"
@@ -375,8 +368,7 @@ with bar_col3:
     with col_snap:
         if st.button("📸 Snap", use_container_width=True):
             st.toast("Replay Snapshot captured!", icon="📸")
-
-    # Speed slider smaller
+with sub_col4:
     st.session_state.autoplay_speed = st.slider("Autoplay Speed (Hz)", 0.2, 5.0, value=float(st.session_state.autoplay_speed), step=0.2, label_visibility="collapsed")
 
 # ----------------- DYNAMIC CALCULATIONS & LOAD -----------------
@@ -391,7 +383,8 @@ else:
     step = 50.0
     strike_count = 20
 
-# Determine spot price
+# ----------------- TIME-SYNCHRONIZED FEED -----------------
+# Dynamic spot price strictly query-filtered by the EXACT selected replay date and time
 auto_spot = get_spot_price(client, symbol, st.session_state.replay_date, st.session_state.replay_time, mode)
 nearest_atm = round(round(auto_spot / step) * step, 2)
 
@@ -492,7 +485,6 @@ spot = float(snap["spot"].iloc[0]) if "spot" in snap.columns and not snap.empty 
 day_open = spot - 110.0  # mock day open if demo or missing
 if not snap.empty and "open" in snap.columns:
     try:
-        # retrieve index day open or estimate
         day_open = get_spot_price(client, symbol, st.session_state.replay_date, time(9, 15), mode)
     except Exception:
         pass
@@ -554,7 +546,9 @@ if out:
 else:
     view = pd.DataFrame(columns=["Strike", "Right", "LTP", "Volume", "OI", "IV %", "Delta", "Gamma", "Theta", "Vega", "Rho"])
 
+# Global quotes dictionary for LTP lookups
 quotes = {(str(r.Right), float(r.Strike)): float(r.LTP) for _, r in view.iterrows()}
+st.session_state.last_quotes = quotes
 
 atm_call_ltp = quotes.get(("CALL", nearest_atm), 0.0)
 atm_put_ltp = quotes.get(("PUT", nearest_atm), 0.0)
@@ -575,7 +569,7 @@ if metric_cols[4].button("+ Add Futures", use_container_width=True):
         "right": "FUT",
         "strike": future_price,
         "side": "BUY",
-        "qty": 50,
+        "qty": get_lot_size(symbol),
         "avg": future_price,
         "sl_pct": None,
         "tp_pct": None,
@@ -593,6 +587,60 @@ if metric_cols[6].button("Import Strategy", use_container_width=True):
 
 st.markdown("---")
 
+# ----------------- CUSTOM STYLE SHEET (TARGETED OVERRIDES FOR STOCKMOCK SPEC) -----------------
+st.markdown("""
+<style>
+/* Decrease table font size & padding to be compact */
+.mock-table th {
+    font-size: 11px !important;
+    padding: 3px 4px !important;
+    font-weight: 700;
+}
+.mock-table td {
+    font-size: 12px !important;
+    padding: 3px 5px !important;
+}
+.strike-atm, .atm-row {
+    background-color: #EBF3FC !important;
+    color: #1e3a8a !important;
+    font-weight: 800 !important;
+}
+.strike-standard {
+    background-color: #f1f5f9;
+    color: #0f172a;
+    font-weight: bold;
+}
+/* Shading theme */
+.itm-ce {
+    background-color: #FFFDF0 !important;
+}
+.itm-pe {
+    background-color: #FFFDF0 !important;
+}
+/* Action Badges B/S hover */
+.btn-b {
+    background-color: #d1fae5 !important;
+    color: #065f46 !important;
+    border: 1px solid #34d399 !important;
+    font-weight: 900 !important;
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-size: 11px;
+    cursor: pointer;
+}
+.btn-s {
+    background-color: #fee2e2 !important;
+    color: #991b1b !important;
+    border: 1px solid #f87171 !important;
+    font-weight: 900 !important;
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-size: 11px;
+    cursor: pointer;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ----------------- STEP 5: SPLIT PANEL LAYOUT -----------------
 panel_col1, panel_col2 = st.columns([5.2, 4.8])
 
@@ -600,32 +648,52 @@ panel_col1, panel_col2 = st.columns([5.2, 4.8])
 with panel_col1:
     st.markdown("### 🧬 Option Chain Matrix")
 
-    # Expiry Tabs Header
-    tabs_cols = st.columns(len(expiry_options[:4]))
-    for idx, exp_opt in enumerate(expiry_options[:4]):
+    # Expiry Tabs Header with Pagination Controls (◀ / ▶)
+    # Allows infinite viewing of CM, NM, FM expiries nicely
+    if "expiry_page_start" not in st.session_state:
+        st.session_state.expiry_page_start = 0
+
+    st.session_state.expiry_page_start = max(0, min(st.session_state.expiry_page_start, len(expiry_options) - 3))
+
+    pag_cols = st.columns([0.5, 2, 2, 2, 0.5])
+
+    # Left Arrow
+    with pag_cols[0]:
+        if st.button("◀", key="prev_expiry_page", use_container_width=True):
+            st.session_state.expiry_page_start = max(0, st.session_state.expiry_page_start - 1)
+            st.rerun()
+
+    # Page View of 3 tabs
+    visible_expiries = expiry_options[st.session_state.expiry_page_start : st.session_state.expiry_page_start + 3]
+    for idx_tab, exp_opt in enumerate(visible_expiries):
         is_active = (exp_opt == active_expiry)
         label = exp_opt.strftime("%d %b '%y").upper()
-        if idx == 0:
-            label += " (CW)"
-        elif idx == 1:
-            label += " (NW)"
+        if idx_tab == 0 and st.session_state.expiry_page_start == 0:
+            label += " (CM)"
+        elif idx_tab == 1 and st.session_state.expiry_page_start == 0:
+            label += " (NM)"
+        elif idx_tab == 2 and st.session_state.expiry_page_start == 0:
+            label += " (FM)"
 
         btn_type = "primary" if is_active else "secondary"
-        if tabs_cols[idx].button(label, key=f"btn_exp_tab_{idx}", type=btn_type, use_container_width=True):
-            st.session_state.active_expiry_date = exp_opt
+        with pag_cols[idx_tab + 1]:
+            if st.button(label, key=f"btn_exp_tab_pag_{idx_tab}", type=btn_type, use_container_width=True):
+                st.session_state.active_expiry_date = exp_opt
+                st.rerun()
+
+    # Right Arrow
+    with pag_cols[4]:
+        if st.button("▶", key="next_expiry_page", use_container_width=True):
+            st.session_state.expiry_page_start = min(len(expiry_options) - 3, st.session_state.expiry_page_start + 1)
             st.rerun()
 
     # Summary Strip
     strip_cols = st.columns(6)
-
-    # Compute straddle & Max Pain
     straddle_prem = atm_call_ltp + atm_put_ltp
-
     call_oi_tot = view[view.Right == "CALL"]["OI"].sum()
     put_oi_tot = view[view.Right == "PUT"]["OI"].sum()
     pcr = put_oi_tot / call_oi_tot if call_oi_tot > 0 else 1.0
 
-    # Estimate ATM IV
     atm_iv = view[(view.Strike == nearest_atm) & (view.Right == "CALL")]["IV %"].mean()
     if np.isnan(atm_iv) or not np.isfinite(atm_iv):
         atm_iv = 16.5
@@ -635,51 +703,9 @@ with panel_col1:
     strip_cols[2].metric("Straddle Prem", f"₹{straddle_prem:.2f}")
     strip_cols[3].metric("PCR", f"{pcr:.2f}")
     strip_cols[4].metric("Call/Put OI", f"{call_oi_tot/10000000:.1f}Cr / {put_oi_tot/10000000:.1f}Cr")
-    strip_cols[5].metric("Max Pain Strike", f"₹{nearest_atm:,.0f}")
-
-    # Hidden action dispatcher input
-    action_input = st.text_input("HiddenTradeSignalInput", key="action_input", placeholder="HiddenTradeSignalInput", label_visibility="collapsed")
-    if action_input:
-        parts = action_input.split(":")
-        if len(parts) == 3:
-            cmd, right_str, strike_str = parts
-            strike_val = float(strike_str)
-            right_val = right_str.upper()
-
-            if cmd == "DESELECT":
-                st.session_state.positions = [p for p in st.session_state.positions if not (p["strike"] == strike_val and p["right"].upper() == right_val)]
-                st.toast(f"Deselected {right_val} {strike_val}", icon="🗑️")
-                st.rerun()
-            elif cmd in ["BUY", "SELL"]:
-                # Check for existing position to stack lots
-                match = None
-                for p in st.session_state.positions:
-                    if p["strike"] == strike_val and p["right"].upper() == right_val and p["side"].upper() == cmd:
-                        match = p
-                        break
-
-                ltp_val = quotes.get((right_val, strike_val), 0.0)
-                qty_step = 50 if symbol == "NIFTY" else (25 if symbol == "BANKNIFTY" else 40)
-
-                if match:
-                    match["qty"] += qty_step
-                else:
-                    st.session_state.positions.append({
-                        "id": str(uuid.uuid4()),
-                        "right": right_val,
-                        "strike": strike_val,
-                        "side": cmd,
-                        "qty": qty_step,
-                        "avg": ltp_val,
-                        "sl_pct": None,
-                        "tp_pct": None,
-                        "entry_time": str(st.session_state.replay_time)
-                    })
-                st.toast(f"Executed Order: {cmd} {right_val} {strike_val} @ ₹{ltp_val:.2f}", icon="🛒")
-                st.rerun()
+    strip_cols[5].metric("Max Pain", f"₹{nearest_atm:,.0f}")
 
     # Render Option Matrix Table (Call LTP (Delta), Call OI bar, Strike, Put OI bar, Put LTP (Delta))
-    # Slicing 21 strikes centered centered around dynamic ATM
     atm_grid = sorted(round(nearest_atm + (i - 10) * step, 2) for i in range(21))
     sliced_view = view[view.Strike.isin(atm_grid)].sort_values(["Strike", "Right"])
 
@@ -698,34 +724,36 @@ with panel_col1:
     .mock-table th {
         background-color: #0f172a;
         color: #94a3b8;
-        font-size: 0.72rem;
+        font-size: 11px !important;
         font-weight: 700;
-        padding: 10px 6px;
+        padding: 5px 4px !important;
         text-transform: uppercase;
         border-bottom: 2px solid #1e293b;
     }
     .mock-table td {
-        padding: 8px 6px;
+        padding: 4px 6px !important;
         border-bottom: 1px solid #1e293b;
         text-align: center;
-        font-size: 0.82rem;
+        font-size: 12px !important;
         position: relative;
     }
     .mock-table tr:hover {
         background-color: #1e293b40;
     }
     .itm-ce {
-        background-color: #fbbf240d !important;
+        background-color: #FFFDF0 !important;
+        color: #0f172a !important;
     }
     .itm-pe {
-        background-color: #c084fc0d !important;
+        background-color: #FFFDF0 !important;
+        color: #0f172a !important;
     }
     .hover-cell {
         cursor: pointer;
         transition: background-color 0.15s;
     }
     .hover-cell:hover {
-        background-color: #1e293b80;
+        background-color: #e2e8f080;
     }
     .hover-actions {
         position: absolute;
@@ -734,29 +762,37 @@ with panel_col1:
         align-items: center;
         justify-content: center;
         gap: 6px;
-        background-color: rgba(15, 23, 42, 0.95);
+        background-color: rgba(255, 255, 255, 0.95);
         z-index: 20;
     }
     .hover-cell:hover .hover-actions {
         display: flex;
     }
     .btn-act {
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-weight: bold;
-        font-size: 0.75rem;
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-weight: 900;
+        font-size: 11px;
         border: none;
         cursor: pointer;
         color: white;
     }
-    .btn-b { background-color: #10b981; }
-    .btn-s { background-color: #ef4444; }
+    .btn-b {
+        background-color: #d1fae5 !important;
+        color: #065f46 !important;
+        border: 1px solid #34d399 !important;
+    }
+    .btn-s {
+        background-color: #fee2e2 !important;
+        color: #991b1b !important;
+        border: 1px solid #f87171 !important;
+    }
     .badge-act {
         display: inline-block;
-        padding: 1px 5px;
-        border-radius: 3px;
-        font-size: 0.68rem;
-        font-weight: bold;
+        padding: 1px 4px;
+        border-radius: 2px;
+        font-size: 10px;
+        font-weight: 900;
         margin-top: 2px;
     }
     .badge-b {
@@ -770,21 +806,19 @@ with panel_col1:
         border: 1px solid rgba(239, 68, 68, 0.3);
     }
     .strike-atm {
-        background-color: #020617;
-        border: 2px solid #22c55e !important;
-        color: #38bdf8 !important;
-        font-weight: 800;
-        font-size: 1.0rem;
+        background-color: #EBF3FC !important;
+        color: #1e3a8a !important;
+        font-weight: 800 !important;
     }
     .strike-standard {
-        background-color: #1e293b;
-        color: #38bdf8;
+        background-color: #f1f5f9;
+        color: #0f172a;
         font-weight: bold;
     }
     .oi-bar-container {
         width: 100%;
-        background-color: rgba(255,255,255,0.03);
-        height: 14px;
+        background-color: rgba(0,0,0,0.04);
+        height: 12px;
         border-radius: 2px;
         overflow: hidden;
         position: relative;
@@ -796,8 +830,9 @@ with panel_col1:
     }
     </style>
     <script>
-    function dispatchAction(actionStr) {
-        window.parent.postMessage(actionStr, "*");
+    function triggerTrade(action, right, strike) {
+        // Dynamic navigation to parent window to process action parameters instantly
+        window.parent.location.href = "?action=" + action + ":" + right + ":" + strike + "&symbol_name=" + "__SYMBOL__";
     }
     </script>
     <table class="mock-table">
@@ -842,11 +877,11 @@ with panel_col1:
             if ce_qty > 0:
                 ce_badge = f'<br/><span class="badge-act badge-b">B {ce_qty}</span>'
             ce_ltp_cell = f"""
-            <td class="hover-cell {ce_cls}" oncontextmenu="event.preventDefault(); dispatchAction('DESELECT:CALL:{strk}');">
+            <td class="hover-cell {ce_cls}" oncontextmenu="event.preventDefault(); triggerTrade('DESELECT', 'CALL', '{strk}');">
                 <span>₹{ce.LTP:.2f} {ce_delta_lbl}</span>{ce_badge}
                 <div class="hover-actions">
-                    <button class="btn-act btn-b" onclick="dispatchAction('BUY:CALL:{strk}')">B</button>
-                    <button class="btn-act btn-s" onclick="dispatchAction('SELL:CALL:{strk}')">S</button>
+                    <button class="btn-act btn-b" onclick="triggerTrade('BUY', 'CALL', '{strk}')">[B]</button>
+                    <button class="btn-act btn-s" onclick="triggerTrade('SELL', 'CALL', '{strk}')">[S]</button>
                 </div>
             </td>
             """
@@ -858,7 +893,7 @@ with panel_col1:
             <td>
                 <div class="oi-bar-container">
                     <div class="oi-bar-fill" style="background-color: rgba(16, 185, 129, 0.25); width: {oi_pct}%; right: 0;"></div>
-                    <span style="position: relative; z-index: 5; font-size: 0.75rem; color: #10b981;">{oi_m:.2f}Cr</span>
+                    <span style="position: relative; z-index: 5; font-size: 0.72rem; color: #10b981;">{oi_m:.2f}Cr</span>
                 </div>
             </td>
             """
@@ -873,11 +908,11 @@ with panel_col1:
             if pe_qty > 0:
                 pe_badge = f'<br/><span class="badge-act badge-b">B {pe_qty}</span>'
             pe_ltp_cell = f"""
-            <td class="hover-cell {pe_cls}" oncontextmenu="event.preventDefault(); dispatchAction('DESELECT:PUT:{strk}');">
+            <td class="hover-cell {pe_cls}" oncontextmenu="event.preventDefault(); triggerTrade('DESELECT', 'PUT', '{strk}');">
                 <span>₹{pe.LTP:.2f} {pe_delta_lbl}</span>{pe_badge}
                 <div class="hover-actions">
-                    <button class="btn-act btn-b" onclick="dispatchAction('BUY:PUT:{strk}')">B</button>
-                    <button class="btn-act btn-s" onclick="dispatchAction('SELL:PUT:{strk}')">S</button>
+                    <button class="btn-act btn-b" onclick="triggerTrade('BUY', 'PUT', '{strk}')">[B]</button>
+                    <button class="btn-act btn-s" onclick="triggerTrade('SELL', 'PUT', '{strk}')">[S]</button>
                 </div>
             </td>
             """
@@ -889,7 +924,7 @@ with panel_col1:
             <td>
                 <div class="oi-bar-container">
                     <div class="oi-bar-fill" style="background-color: rgba(239, 68, 68, 0.25); width: {oi_pct}%; left: 0;"></div>
-                    <span style="position: relative; z-index: 5; font-size: 0.75rem; color: #ef4444;">{oi_m:.2f}Cr</span>
+                    <span style="position: relative; z-index: 5; font-size: 0.72rem; color: #ef4444;">{oi_m:.2f}Cr</span>
                 </div>
             </td>
             """
@@ -909,7 +944,8 @@ with panel_col1:
         html_elements.append(row_html)
 
     html_elements.append("</tbody></table>")
-    st.components.v1.html("\n".join(html_elements), height=640, scrolling=True)
+    html_rendered = "\n".join(html_elements).replace("__SYMBOL__", symbol)
+    st.components.v1.html(html_rendered, height=550, scrolling=True)
 
 # --- RIGHT PANEL: PAYOFF CHART & ANALYTICS ---
 with panel_col2:
@@ -1021,30 +1057,22 @@ with panel_col2:
         else:
             fig_payoff = go.Figure()
 
-            # Profit zone green shading
-            profit_shade = np.maximum(expiry_pnl_scan, 0)
+            # Loss zone red shading fillcolor
             fig_payoff.add_trace(go.Scatter(
-                x=scan_points, y=profit_shade, mode="lines", line=dict(width=0),
-                fill="tozeroy", fillcolor="rgba(16, 185, 129, 0.15)", showlegend=False
-            ))
-
-            # Loss zone red shading
-            loss_shade = np.minimum(expiry_pnl_scan, 0)
-            fig_payoff.add_trace(go.Scatter(
-                x=scan_points, y=loss_shade, mode="lines", line=dict(width=0),
+                x=scan_points, y=np.minimum(expiry_pnl_scan, 0), mode="lines", line=dict(width=0),
                 fill="tozeroy", fillcolor="rgba(239, 68, 68, 0.15)", showlegend=False
             ))
 
-            # Expiry line
+            # Expiry line (Solid bright green curve)
             fig_payoff.add_trace(go.Scatter(
                 x=scan_points, y=expiry_pnl_scan, mode="lines",
-                line=dict(color="#10b981", width=3), name="Expiry Payoff"
+                line=dict(color="#00e676", width=3), name="Expiry Payoff"
             ))
 
-            # Today T+0 curve
+            # Today T+0 curve (Dashed blue line)
             fig_payoff.add_trace(go.Scatter(
                 x=scan_points, y=t0_pnl_scan, mode="lines",
-                line=dict(color="#3b82f6", width=2, dash="dash"), name="Today's MTM (T+0)"
+                line=dict(color="#29b6f6", width=2, dash="dash"), name="Today's MTM (T+0)"
             ))
 
             # Add spot vertical line (with correct keyword 'line_width')
@@ -1058,7 +1086,7 @@ with panel_col2:
 
             fig_payoff.update_layout(
                 xaxis_title="Underlying Spot (₹)", yaxis_title="Profit / Loss (₹)",
-                height=380, hovermode="x unified", template="plotly_dark",
+                height=350, hovermode="x unified", template="plotly_dark",
                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
             )
             st.plotly_chart(fig_payoff, use_container_width=True)
@@ -1079,20 +1107,20 @@ with panel_col2:
         t_cols = st.columns(3)
         if t_cols[0].button("Short Straddle (ATM)", key="builder_straddle", use_container_width=True):
             st.session_state.positions = [
-                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm), "side": "SELL", "qty": 50, "avg": quotes.get(("CALL", nearest_atm), 100.0), "sl_pct": 20.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
-                {"id": str(uuid.uuid4()), "right": "PUT", "strike": float(nearest_atm), "side": "SELL", "qty": 50, "avg": quotes.get(("PUT", nearest_atm), 100.0), "sl_pct": 20.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
+                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm), "side": "SELL", "qty": get_lot_size(symbol), "avg": quotes.get(("CALL", nearest_atm), 100.0), "sl_pct": 20.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
+                {"id": str(uuid.uuid4()), "right": "PUT", "strike": float(nearest_atm), "side": "SELL", "qty": get_lot_size(symbol), "avg": quotes.get(("PUT", nearest_atm), 100.0), "sl_pct": 20.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
             ]
             st.rerun()
         if t_cols[1].button("Short Strangle (OTM)", key="builder_strangle", use_container_width=True):
             st.session_state.positions = [
-                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm + step), "side": "SELL", "qty": 50, "avg": quotes.get(("CALL", nearest_atm + step), 40.0), "sl_pct": 25.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
-                {"id": str(uuid.uuid4()), "right": "PUT", "strike": float(nearest_atm - step), "side": "SELL", "qty": 50, "avg": quotes.get(("PUT", nearest_atm - step), 40.0), "sl_pct": 25.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
+                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm + step), "side": "SELL", "qty": get_lot_size(symbol), "avg": quotes.get(("CALL", nearest_atm + step), 40.0), "sl_pct": 25.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
+                {"id": str(uuid.uuid4()), "right": "PUT", "strike": float(nearest_atm - step), "side": "SELL", "qty": get_lot_size(symbol), "avg": quotes.get(("PUT", nearest_atm - step), 40.0), "sl_pct": 25.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
             ]
             st.rerun()
         if t_cols[2].button("Bull Call Spread", key="builder_bull", use_container_width=True):
             st.session_state.positions = [
-                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm), "side": "BUY", "qty": 50, "avg": quotes.get(("CALL", nearest_atm), 100.0), "sl_pct": None, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
-                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm + step), "side": "SELL", "qty": 50, "avg": quotes.get(("CALL", nearest_atm + step), 40.0), "sl_pct": None, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
+                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm), "side": "BUY", "qty": get_lot_size(symbol), "avg": quotes.get(("CALL", nearest_atm), 100.0), "sl_pct": None, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
+                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm + step), "side": "SELL", "qty": get_lot_size(symbol), "avg": quotes.get(("CALL", nearest_atm + step), 40.0), "sl_pct": None, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
             ]
             st.rerun()
 
@@ -1112,10 +1140,9 @@ bottom_tab1, bottom_tab2 = st.tabs(["💼 Active Positions Table", "📊 Aggrega
 
 with bottom_tab1:
     if not active_positions:
-        st.info("No active positions currently. Click B/S on Option chain LTP to execute paper trades.")
+        st.info("No active positions currently. Click [B]/[S] on Option chain LTP to execute paper trades.")
     else:
-        # Columns matching requirement
-        # Checkbox select, Action (B/S badge), Lots, Qty, Strike, Expiry, Entry Price, LTP, P&L (color-coded), and Lots Exit / Delete Icon.
+        # Table Columns matching requirement exactly
         pos_header = st.columns([0.6, 1.0, 1.0, 1.0, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0])
         pos_header[0].markdown("**Select**")
         pos_header[1].markdown("**Action**")
@@ -1136,7 +1163,6 @@ with bottom_tab1:
             p_qty = p["qty"]
             p_avg = p["avg"]
 
-            # Fetch current LTP
             if p_right == "FUT":
                 p_ltp = spot
                 strike_display = f"{p_strike:,.0f} FUT"
@@ -1145,44 +1171,32 @@ with bottom_tab1:
                 strike_display = f"{p_strike:,.0f} {p_right}"
 
             pnl_val = p_qty * (p_ltp - p_avg) * (1.0 if p_side == "BUY" else -1.0)
-            lots_val = int(p_qty / 50) if symbol == "NIFTY" else int(p_qty / 25)
+            lot_size_v = get_lot_size(symbol)
+            lots_val = int(p_qty / lot_size_v)
 
             p_cols = st.columns([0.6, 1.0, 1.0, 1.0, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0])
 
-            # Checkbox select
             is_sel = p_cols[0].checkbox("", value=(p_id in st.session_state.selected_rows), key=f"sel_{p_id}")
             if is_sel:
                 st.session_state.selected_rows.add(p_id)
             else:
                 st.session_state.selected_rows.discard(p_id)
 
-            # Action badge
+            # Soft-green B/S badges
             badge_color = "green" if p_side == "BUY" else "red"
             p_cols[1].markdown(f"<span class='tag-{badge_color}'>{p_side}</span>", unsafe_allow_html=True)
 
-            # Lots
             p_cols[2].write(f"{lots_val} Lot")
-
-            # Qty
             p_cols[3].write(f"{p_qty}")
-
-            # Strike
             p_cols[4].write(strike_display)
-
-            # Expiry
             p_cols[5].write(active_expiry.strftime("%d-%b-%Y"))
-
-            # Entry Price
             p_cols[6].write(f"₹{p_avg:.2f}")
-
-            # LTP
             p_cols[7].write(f"₹{p_ltp:.2f}")
 
             # P&L color-coded
             color_pnl = "#22c55e" if pnl_val >= 0 else "#ef4444"
             p_cols[8].markdown(f"<b style='color: {color_pnl};'>₹{pnl_val:,.2f}</b>", unsafe_allow_html=True)
 
-            # Exit Button
             if p_cols[9].button("❌", key=f"del_{p_id}"):
                 st.session_state.positions = [item for item in st.session_state.positions if item["id"] != p_id]
                 st.toast(f"Closed position: {p_side} {p_right} {p_strike}", icon="ℹ️")
@@ -1191,21 +1205,15 @@ with bottom_tab1:
         # Footer Bar adjustments
         st.markdown("<br/>", unsafe_allow_html=True)
         foot_cols = st.columns([1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5])
-
-        # Multiplier
         st.session_state.multiplier = foot_cols[0].number_input("Multiplier Adjustment", min_value=1, max_value=100, value=st.session_state.multiplier, step=1)
-
-        foot_cols[1].write(f"**Lot Size:** {50 if symbol == 'NIFTY' else 25}")
+        foot_cols[1].write(f"**Lot Size:** {get_lot_size(symbol)}")
 
         if foot_cols[2].button("🔔 Add Alert", use_container_width=True):
             st.toast("Alert created for the active strategy parameters!", icon="🔔")
-
         if foot_cols[3].button("💾 Save Strategy", use_container_width=True):
             st.toast("Paper strategy configuration saved to workspace!", icon="💾")
-
         if foot_cols[4].button("🔗 Share", use_container_width=True):
             st.toast("Link to simulator setup copied to clipboard!", icon="🔗")
-
         if foot_cols[5].button("🚪 Exit Selected", use_container_width=True):
             if st.session_state.selected_rows:
                 st.session_state.positions = [item for item in st.session_state.positions if item["id"] not in st.session_state.selected_rows]
@@ -1214,7 +1222,6 @@ with bottom_tab1:
                 st.rerun()
             else:
                 st.toast("No positions selected!", icon="⚠️")
-
         if foot_cols[6].button("🧹 Clear All", use_container_width=True):
             st.session_state.positions = []
             st.session_state.selected_rows.clear()
@@ -1236,7 +1243,6 @@ with bottom_tab2:
         p_avg = p["avg"]
 
         if p_right != "FUT":
-            # Match in view to extract greek row
             match_g = view[(view.Strike == p_strike) & (view.Right == p_right)]
             if not match_g.empty:
                 g_row = match_g.iloc[0]

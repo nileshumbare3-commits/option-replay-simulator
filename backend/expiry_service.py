@@ -15,6 +15,15 @@ MONTHLY_MAP = {
 WEEKLY_MONTH_MAP_REV = {v: k for k, v in WEEKLY_MONTH_MAP.items()}
 MONTHLY_MAP_REV = {v: k for k, v in MONTHLY_MAP.items()}
 
+def get_nearest_weekday(start_date: date, target_weekday: int) -> date:
+    """
+    Finds the nearest future/current weekday (0=Mon, 1=Tue, 2=Wed, 3=Thu, etc.) >= start_date.
+    """
+    days_ahead = target_weekday - start_date.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    return start_date + timedelta(days=days_ahead)
+
 def parse_expiry_from_symbol_name(symbol_name: str, sibling_weekly_dates=None) -> date:
     """
     Extract the expiry date directly from the contract string format:
@@ -64,34 +73,39 @@ def parse_expiry_from_contract(contract_symbol: str) -> date:
 def generate_mock_symbols_for_demo(underlying: str, atm_strike: float, step: float, replay_date: date) -> list:
     """
     Generates a realistic set of weekly and monthly contract symbols centered around the ATM strike
-    for 4 expiries near the replay date.
+    for 4 expiries dynamically aligned to standard index weekdays.
     """
-    # Expiries at 4 offsets: e.g. 5, 12, 19, 26 days from replay_date
-    exp_offsets = [5, 12, 19, 26]
+    underlying_upper = underlying.upper().strip()
+
+    # Standard index weekdays: NIFTY = 3 (Thursday), BANKNIFTY = 2 (Wednesday), FINNIFTY = 1 (Tuesday)
+    target_weekday = 3
+    if "BANK" in underlying_upper:
+        target_weekday = 2
+    elif "FIN" in underlying_upper:
+        target_weekday = 1
+
+    first_expiry = get_nearest_weekday(replay_date, target_weekday)
+
+    # 4 expiries at 7-day intervals
+    exp_dates = [first_expiry + timedelta(days=7 * i) for i in range(4)]
+
     strikes = [round(atm_strike + (i - 10) * step, 2) for i in range(21)]
     symbols = []
 
-    underlying_upper = underlying.upper().strip()
-
-    # We will generate monthly symbol for the last offset, weekly for the first three
-    for idx, offset in enumerate(exp_offsets):
-        exp_date = replay_date + timedelta(days=offset)
+    for idx, exp_date in enumerate(exp_dates):
         yy = exp_date.strftime("%y")
         month_val = exp_date.month
 
-        # Determine whether to format as monthly or weekly
-        # To make it realistic, the last one can be monthly
+        # Last one formatted as monthly (e.g. 26AUG), first three as weekly (e.g. 26825)
         is_monthly = (idx == 3)
 
         for strike in strikes:
             strike_str = str(int(strike))
             for right in ["CE", "PE"]:
                 if is_monthly:
-                    # e.g., NIFTY26AUG24500CE
                     month_str = MONTHLY_MAP_REV.get(month_val, "AUG")
                     sym = f"{underlying_upper}{yy}{month_str}{strike_str}{right}"
                 else:
-                    # e.g., NIFTY2682524500CE
                     month_code = WEEKLY_MONTH_MAP_REV.get(month_val, str(month_val))
                     day_str = f"{exp_date.day:02d}"
                     sym = f"{underlying_upper}{yy}{month_code}{day_str}{strike_str}{right}"
