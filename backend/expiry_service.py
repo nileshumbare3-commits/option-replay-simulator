@@ -1,137 +1,5 @@
-import os
-import zipfile
-import requests
-import io
 import re
-import pandas as pd
 from datetime import date, datetime, timedelta
-
-# Local memory cache: { (symbol): {"expiries": list, "cached_at": datetime} }
-EXPIRY_CACHE = {}
-
-# Standard NSE Derivatives Pre-compiled Real Expiry Calendar for 2025/2026 (Resilient Fallback)
-# Contains actual, real official weekly and monthly NSE options expiries, fully verified
-REAL_NSE_EXPIRIES_2025_2026 = {
-    "NIFTY": [
-        # 2025 Expiries (Thursday)
-        date(2025, 7, 3), date(2025, 7, 10), date(2025, 7, 17), date(2025, 7, 24), date(2025, 7, 31),
-        date(2025, 8, 7), date(2025, 8, 14), date(2025, 8, 21), date(2025, 8, 28),
-        date(2025, 9, 4), date(2025, 9, 11), date(2025, 9, 18), date(2025, 9, 25),
-        # 2026 Expiries (Thursday)
-        date(2026, 7, 2), date(2026, 7, 9), date(2026, 7, 16), date(2026, 7, 23), date(2026, 7, 30),
-        date(2026, 8, 6), date(2026, 8, 13), date(2026, 8, 20), date(2026, 8, 27),
-        date(2026, 9, 3), date(2026, 9, 10), date(2026, 9, 17), date(2026, 9, 24), date(2026, 10, 1),
-    ],
-    "BANKNIFTY": [
-        # 2025 Expiries (Wednesday, Thursday on Monthly Expiry week)
-        date(2025, 7, 2), date(2025, 7, 9), date(2025, 7, 16), date(2025, 7, 23), date(2025, 7, 31),
-        date(2025, 8, 6), date(2025, 8, 13), date(2025, 8, 20), date(2025, 8, 28),
-        date(2025, 9, 3), date(2025, 9, 10), date(2025, 9, 17), date(2025, 9, 25),
-        # 2026 Expiries (Wednesday, Thursday on Monthly Expiry week)
-        date(2026, 7, 1), date(2026, 7, 8), date(2026, 7, 15), date(2026, 7, 22), date(2026, 7, 30),
-        date(2026, 8, 5), date(2026, 8, 12), date(2026, 8, 19), date(2026, 8, 27),
-        date(2026, 9, 2), date(2026, 9, 9), date(2026, 9, 16), date(2026, 9, 24),
-    ],
-    "FINNIFTY": [
-        # 2025 Expiries (Tuesday)
-        date(2025, 7, 1), date(2025, 7, 8), date(2025, 7, 15), date(2025, 7, 22), date(2025, 7, 29),
-        date(2025, 8, 5), date(2025, 8, 12), date(2025, 8, 19), date(2025, 8, 26),
-        date(2025, 9, 2), date(2025, 9, 9), date(2025, 9, 16), date(2025, 9, 23), date(2025, 9, 30),
-        # 2026 Expiries (Tuesday)
-        date(2026, 7, 7), date(2026, 7, 14), date(2026, 7, 21), date(2026, 7, 28),
-        date(2026, 8, 4), date(2026, 8, 11), date(2026, 8, 18), date(2026, 8, 25),
-        date(2026, 9, 1), date(2026, 9, 8), date(2026, 9, 15), date(2026, 9, 22), date(2026, 9, 29),
-    ]
-}
-
-def download_security_master_expiries(symbol: str) -> list:
-    """
-    Downloads, extracts, and parses the official daily ICICI Breeze Security Master.
-    """
-    url = "https://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip"
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code == 200:
-            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-                csv_filename = [f for f in z.namelist() if "SecurityMaster" in f and f.endswith(".csv")]
-                if csv_filename:
-                    with z.open(csv_filename[0]) as csv_file:
-                        df = pd.read_csv(csv_file, low_memory=False)
-                        df_filtered = df[(df["ExchangeCode"] == "NFO") & (df["ShortName"] == symbol.upper())]
-                        if not df_filtered.empty and "ExpiryDate" in df_filtered.columns:
-                            raw_dates = df_filtered["ExpiryDate"].dropna().unique()
-                            dates_list = []
-                            for d_str in raw_dates:
-                                try:
-                                    if "T" in d_str:
-                                        d_val = datetime.strptime(d_str.split("T")[0], "%Y-%m-%d").date()
-                                    else:
-                                        d_val = datetime.strptime(d_str, "%Y-%m-%d").date()
-                                    dates_list.append(d_val)
-                                except Exception:
-                                    pass
-                            return sorted(list(set(dates_list)))
-    except Exception as e:
-        print(f"Breeze Security Master Download failed or timed out: {e}")
-    return []
-
-def get_official_expiry_dates(selected_day: date, symbol: str, client=None) -> list:
-    """
-    Dynamic contract sync orchestrator:
-    1. Check 24-hour cache.
-    2. Try Breeze Security Master Pipeline.
-    3. Fallback 1: On-the-Fly API Fetch.
-    4. Fallback 2: Pre-compiled official NSE Expiry Calendar (completely free of weekday offsets).
-    """
-    symbol_upper = symbol.upper()
-    now = datetime.now()
-
-    if symbol_upper in EXPIRY_CACHE:
-        cache_data = EXPIRY_CACHE[symbol_upper]
-        cached_time = cache_data["cached_at"]
-        if now - cached_time < timedelta(hours=24):
-            return filter_expiries_for_replay(selected_day, cache_data["expiries"])
-
-    # Attempt Security Master Download
-    expiries = download_security_master_expiries(symbol_upper)
-
-    # Fallback 1: On-the-Fly API
-    if not expiries and client and client.configured:
-        try:
-            quotes = client.get_option_chain_quotes(symbol_upper)
-            if quotes:
-                real_expiries = set()
-                for q in quotes:
-                    exp_str = q.get("expiry_date")
-                    if exp_str:
-                        d_val = datetime.strptime(exp_str.split("T")[0], "%Y-%m-%d").date()
-                        real_expiries.add(d_val)
-                expiries = sorted(list(real_expiries))
-        except Exception:
-            pass
-
-    # Fallback 2: Resilient pre-compiled NSE Expiry Calendar
-    if not expiries:
-        expiries = REAL_NSE_EXPIRIES_2025_2026.get(symbol_upper, [])
-
-    if expiries:
-        EXPIRY_CACHE[symbol_upper] = {
-            "expiries": expiries,
-            "cached_at": now
-        }
-
-    return filter_expiries_for_replay(selected_day, expiries)
-
-def filter_expiries_for_replay(selected_day: date, expiries: list) -> list:
-    """
-    Filters contract master list dynamically relative to current replay date.
-    Exposes up to 20 past expiries and 20 future expiries sorted chronologically.
-    """
-    sorted_all = sorted(list(set(expiries)))
-    past = [d for d in sorted_all if d < selected_day][-20:]
-    active_future = [d for d in sorted_all if d >= selected_day][:21]
-    return sorted(past + active_future)
-
 
 # Month mapping for weekly option contracts
 WEEKLY_MONTH_MAP = {
@@ -144,84 +12,194 @@ MONTHLY_MAP = {
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
 }
 
-def parse_expiry_from_contract(contract_symbol: str) -> date:
-    """
-    Parses expiry date from NSE / Breeze option contract symbol.
-    Examples:
-      - NIFTY26AUG24500CE  -> 2026-08-25 (or last Thursday/Tuesday of Aug 2026)
-      - NIFTY2682524500CE  -> 2026-08-25 (Weekly: 25th Aug 2026)
-      - BANKNIFTY26O1552000PE -> 2026-10-15 (Weekly: 15th Oct 2026)
-    """
-    symbol = contract_symbol.upper().strip()
+WEEKLY_MONTH_MAP_REV = {v: k for k, v in WEEKLY_MONTH_MAP.items()}
+MONTHLY_MAP_REV = {v: k for k, v in MONTHLY_MAP.items()}
 
-    # 1. Check for WEEKLY Expiry Format: [SYMBOL][YY][M/O/N/D][DD][STRIKE][CE/PE]
-    # Example: NIFTY2682524500CE -> YY=26, Month=8, Day=25
+def get_nearest_weekday(start_date: date, target_weekday: int) -> date:
+    """
+    Finds the nearest future/current weekday (0=Mon, 1=Tue, 2=Wed, 3=Thu, etc.) >= start_date.
+    """
+    days_ahead = target_weekday - start_date.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    return start_date + timedelta(days=days_ahead)
+
+def parse_expiry_from_symbol_name(symbol_name: str, sibling_weekly_dates=None) -> date:
+    """
+    Extract the expiry date directly from the contract string format:
+    - Weekly Format: NIFTY2682524500CE -> Extract 26 (Year 2026), 8 (Month Aug), 25 (Day 25) -> 2026-08-25
+    - Monthly Format: NIFTY26AUG24500CE -> Extract 26 (Year 2026), AUG (Month 08).
+      If sibling_weekly_dates is provided, find the maximum weekly date of that year and month.
+      Otherwise, fall back to the last day of that month.
+    """
+    symbol = symbol_name.upper().strip()
+
+    # 1. Weekly Format Example: [SYMBOL][YY][M/O/N/D][DD][STRIKE][CE/PE]
+    # e.g., NIFTY2682524500CE or BANKNIFTY26O1552000PE
     weekly_match = re.search(r'(\d{2})([1-9OND])(\d{2})\d+(CE|PE)$', symbol)
     if weekly_match:
         yy_str, month_code, day_str = weekly_match.groups()[:3]
         year = 2000 + int(yy_str)
         month = WEEKLY_MONTH_MAP[month_code]
         day = int(day_str)
-        return datetime(year, month, day).date()
+        return date(year, month, day)
 
-    # 2. Check for MONTHLY Expiry Format: [SYMBOL][YY][MMM][STRIKE][CE/PE]
-    # Example: NIFTY26AUG24500CE -> YY=26, Month=AUG
+    # 2. Monthly Format Example: [SYMBOL][YY][MMM][STRIKE][CE/PE]
+    # e.g., NIFTY26AUG24500CE
     monthly_match = re.search(r'(\d{2})([A-Z]{3})\d+(CE|PE)$', symbol)
     if monthly_match:
         yy_str, month_str = monthly_match.groups()[:2]
         year = 2000 + int(yy_str)
         month = MONTHLY_MAP.get(month_str)
-
         if month:
-            # Derive the monthly expiry day (Last Thursday or Tuesday of the month)
-            return get_last_expiry_day_of_month(year, month)
+            if sibling_weekly_dates:
+                # Filter for sibling dates with the same year and month
+                siblings = [d for d in sibling_weekly_dates if d.year == year and d.month == month]
+                if siblings:
+                    return max(siblings)
+            # Fallback to the last day of the month (avoiding weekday-based calendar math)
+            import calendar
+            _, last_day = calendar.monthrange(year, month)
+            return date(year, month, last_day)
 
-    raise ValueError(f"Unable to parse expiry date from symbol: {contract_symbol}")
+    raise ValueError(f"Unable to parse expiry date from symbol: {symbol_name}")
 
-
-def get_last_expiry_day_of_month(year: int, month: int) -> date:
+def parse_expiry_from_contract(contract_symbol: str) -> date:
     """
-    Calculates the last trading expiry day of a given month.
-    NSE Expiry Shift:
-      - Before Sept 2025: Last Thursday (weekday = 3)
-      - Sept 2025 onwards: Last Tuesday (weekday = 1)
+    Compatibility wrapper for old codebase imports.
     """
-    import calendar
+    return parse_expiry_from_symbol_name(contract_symbol)
 
-    # Determine weekday target (Thursday = 3, Tuesday = 1)
-    target_weekday = 1 if (year > 2025 or (year == 2025 and month >= 9)) else 3
+def generate_mock_symbols_for_demo(underlying: str, atm_strike: float, step: float, replay_date: date) -> list:
+    """
+    Generates a realistic set of weekly and monthly contract symbols centered around the ATM strike
+    for 4 expiries dynamically aligned to standard index weekdays.
+    """
+    underlying_upper = underlying.upper().strip()
 
-    # Get total days in month
-    _, last_day = calendar.monthrange(year, month)
-    last_date = datetime(year, month, last_day).date()
+    # Standard index weekdays: NIFTY = 3 (Thursday), BANKNIFTY = 2 (Wednesday), FINNIFTY = 1 (Tuesday)
+    target_weekday = 3
+    if "BANK" in underlying_upper:
+        target_weekday = 2
+    elif "FIN" in underlying_upper:
+        target_weekday = 1
 
-    # Roll back to the last target weekday of the month
-    while last_date.weekday() != target_weekday:
-        last_date -= timedelta(days=1)
+    first_expiry = get_nearest_weekday(replay_date, target_weekday)
 
-    return last_date
+    # 4 expiries at 7-day intervals
+    exp_dates = [first_expiry + timedelta(days=7 * i) for i in range(4)]
 
+    strikes = [round(atm_strike + (i - 10) * step, 2) for i in range(21)]
+    symbols = []
 
-def format_contract_symbol(underlying_symbol: str, expiry_date_val: date, strike: float, right: str) -> str:
+    for idx, exp_date in enumerate(exp_dates):
+        yy = exp_date.strftime("%y")
+        month_val = exp_date.month
+
+        # Last one formatted as monthly (e.g. 26AUG), first three as weekly (e.g. 26825)
+        is_monthly = (idx == 3)
+
+        for strike in strikes:
+            strike_str = str(int(strike))
+            for right in ["CE", "PE"]:
+                if is_monthly:
+                    month_str = MONTHLY_MAP_REV.get(month_val, "AUG")
+                    sym = f"{underlying_upper}{yy}{month_str}{strike_str}{right}"
+                else:
+                    month_code = WEEKLY_MONTH_MAP_REV.get(month_val, str(month_val))
+                    day_str = f"{exp_date.day:02d}"
+                    sym = f"{underlying_upper}{yy}{month_code}{day_str}{strike_str}{right}"
+                symbols.append(sym)
+    return symbols
+
+def get_dynamic_expiry_dates(symbol: str, atm_strike: float, step: float, replay_date: date, client=None) -> list:
+    """
+    Dynamically determine available expiry dates by inspecting the active/historical contract symbols
+    for strikes near the current Spot Price (ATM), parsing the expiry dates embedded within those contract names,
+    and sorting/filtering relative to the trading date.
+    """
+    symbols = []
+    symbol_upper = symbol.upper().strip()
+
+    # Step A: Fetch contracts near ATM (try Breeze if configured/active, or generate mock symbols)
+    if client and client.configured and client.session_token:
+        try:
+            # We fetch options quotes to inspect actual active/historical contract symbols
+            quotes = client.get_option_chain_quotes(symbol_upper)
+            if quotes:
+                for q in quotes:
+                    for key in ["symbol", "symbol_name", "contract_name", "symbol_code", "contract_detail"]:
+                        val = q.get(key)
+                        if val and len(val) > 10:
+                            symbols.append(val)
+        except Exception:
+            pass
+
+    if not symbols:
+        symbols = generate_mock_symbols_for_demo(symbol_upper, atm_strike, step, replay_date)
+
+    # Step B: Parse symbol names
+    weekly_dates = []
+    monthly_contracts = []
+
+    for s in symbols:
+        try:
+            # check if it is weekly format (has day digits before CE/PE)
+            if re.search(r'(\d{2})([1-9OND])(\d{2})\d+(CE|PE)$', s.upper().strip()):
+                weekly_dates.append(parse_expiry_from_symbol_name(s))
+            else:
+                monthly_contracts.append(s)
+        except Exception:
+            pass
+
+    unique_weekly = sorted(list(set(weekly_dates)))
+    all_dates = list(unique_weekly)
+
+    for s in monthly_contracts:
+        try:
+            d = parse_expiry_from_symbol_name(s, sibling_weekly_dates=unique_weekly)
+            all_dates.append(d)
+        except Exception:
+            pass
+
+    # Step C: Deduplicate & Sort
+    unique_all = sorted(list(set(all_dates)))
+
+    # Filter for dates >= replay_date
+    filtered_dates = [d for d in unique_all if d >= replay_date]
+    if not filtered_dates:
+        # Fallback if no dates in future to prevent UnboundLocalError or crash
+        filtered_dates = unique_all if unique_all else [replay_date]
+
+    return filtered_dates
+
+def format_contract_symbol(underlying_symbol: str, expiry_date_val: date, strike: float, right: str, available_expiries=None) -> str:
     """
     Encodes an option contract into standardized NSE/Breeze symbol format.
-    Determines whether the expiry is weekly or monthly and formats accordingly.
+    Determines whether the expiry is weekly or monthly (using parsed expiries if available)
+    and formats accordingly, completely free of weekday math.
     """
     yy = expiry_date_val.strftime("%y") # e.g. "26"
     strike_str = str(int(float(strike)))
     right_upper = right.upper()
     right_code = "CE" if right_upper in ["CALL", "CE"] else "PE"
 
-    # Determine if monthly: check if expiry_date is the last target weekday of the month
-    last_exp = get_last_expiry_day_of_month(expiry_date_val.year, expiry_date_val.month)
-    is_monthly = (expiry_date_val == last_exp)
+    # To avoid weekday math, we can see if it's the last expiry of the month from available_expiries
+    is_monthly = False
+    if available_expiries:
+        sibling_expiries = [d for d in available_expiries if d.year == expiry_date_val.year and d.month == expiry_date_val.month]
+        if sibling_expiries and expiry_date_val == max(sibling_expiries):
+            is_monthly = True
+    else:
+        # Simple fallback: if day is >= 25 (last week of the month), treat it as monthly
+        if expiry_date_val.day >= 25:
+            is_monthly = True
 
     if is_monthly:
         month_str = expiry_date_val.strftime("%b").upper() # e.g. "AUG"
         return f"{underlying_symbol.upper()}{yy}{month_str}{strike_str}{right_code}"
     else:
         month_val = expiry_date_val.month
-        # Month mapping for weekly
         inv_map = {v: k for k, v in WEEKLY_MONTH_MAP.items()}
         m_code = inv_map.get(month_val, str(month_val))
         dd_str = f"{expiry_date_val.day:02d}"
