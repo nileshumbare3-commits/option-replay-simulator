@@ -330,19 +330,19 @@ with st.container():
     st.session_state.replay_time = nav_cols[8].time_input("Time", st.session_state.replay_time, label_visibility="collapsed")
 
     # Right controls
-    if nav_cols[9].button("+1m", use_container_width=True):
+    if nav_cols[9].button("1m+", use_container_width=True):
         adjust_replay_time(1)
         st.rerun()
-    if nav_cols[10].button("+5m", use_container_width=True):
+    if nav_cols[10].button("5m+", use_container_width=True):
         adjust_replay_time(5)
         st.rerun()
-    if nav_cols[11].button("+15m", use_container_width=True):
+    if nav_cols[11].button("15m+", use_container_width=True):
         adjust_replay_time(15)
         st.rerun()
-    if nav_cols[12].button("+30m", use_container_width=True):
+    if nav_cols[12].button("30m+", use_container_width=True):
         adjust_replay_time(30)
         st.rerun()
-    if nav_cols[13].button("+2h", use_container_width=True):
+    if nav_cols[13].button("2h+", use_container_width=True):
         adjust_replay_time(120)
         st.rerun()
     if nav_cols[14].button("EOD", use_container_width=True):
@@ -715,38 +715,44 @@ with panel_col1:
     .mock-table {
         width: 100%;
         border-collapse: collapse;
-        background-color: #0b0f19;
-        color: #e2e8f0;
+        background-color: #ffffff;
+        color: #1E1E1E;
         font-family: ui-sans-serif, system-ui, sans-serif;
         border-radius: 8px;
         overflow: hidden;
+        border: 1px solid #e2e8f0;
     }
     .mock-table th {
-        background-color: #0f172a;
-        color: #94a3b8;
+        background-color: #f8fafc;
+        color: #475569;
         font-size: 11px !important;
         font-weight: 700;
         padding: 5px 4px !important;
         text-transform: uppercase;
-        border-bottom: 2px solid #1e293b;
+        border-bottom: 2px solid #e2e8f0;
     }
     .mock-table td {
         padding: 4px 6px !important;
-        border-bottom: 1px solid #1e293b;
+        border-bottom: 1px solid #f1f5f9;
         text-align: center;
         font-size: 12px !important;
         position: relative;
+        color: #1E1E1E;
     }
     .mock-table tr:hover {
-        background-color: #1e293b40;
+        background-color: #f8fafc;
     }
     .itm-ce {
         background-color: #FFFDF0 !important;
-        color: #0f172a !important;
+        color: #1E1E1E !important;
     }
     .itm-pe {
         background-color: #FFFDF0 !important;
-        color: #0f172a !important;
+        color: #1E1E1E !important;
+    }
+    .atm-row {
+        background-color: #EBF3FC !important;
+        color: #1E1E1E !important;
     }
     .hover-cell {
         cursor: pointer;
@@ -863,14 +869,25 @@ with panel_col1:
 
         ce_itm = (strk < spot)
         pe_itm = (strk > spot)
-        ce_cls = "itm-ce" if ce_itm else ""
-        pe_cls = "itm-pe" if pe_itm else ""
-
         is_atm_row = (abs(strk - spot) <= step * 0.51)
+
+        if is_atm_row:
+            ce_cls = "atm-row"
+            pe_cls = "atm-row"
+            oi_ce_cls = "atm-row"
+            oi_pe_cls = "atm-row"
+        else:
+            ce_cls = "itm-ce" if ce_itm else ""
+            pe_cls = "itm-pe" if pe_itm else ""
+            oi_ce_cls = "itm-ce" if ce_itm else ""
+            oi_pe_cls = "itm-pe" if pe_itm else ""
+
         strk_cls = "strike-atm" if is_atm_row else "strike-standard"
         strk_lbl = f"{strk:,.0f} (ATM)" if is_atm_row else f"{strk:,.0f}"
 
         # Call LTP cell
+        lot_sz = get_lot_size(symbol)
+        ce_lots = int(ce_qty / lot_sz) if ce_qty > 0 else 1
         if ce is not None:
             ce_delta_lbl = f"({ce.Delta:.2f})" if "Delta" in ce_r.columns and not np.isnan(ce.Delta) else ""
             ce_badge = ""
@@ -880,6 +897,7 @@ with panel_col1:
             <td class="hover-cell {ce_cls}" oncontextmenu="event.preventDefault(); triggerTrade('DESELECT', 'CALL', '{strk}');">
                 <span>₹{ce.LTP:.2f} {ce_delta_lbl}</span>{ce_badge}
                 <div class="hover-actions">
+                    <span style="font-size: 11px; font-weight: 800; color: #1e293b; margin-right: 4px;">{ce_lots}</span>
                     <button class="btn-act btn-b" onclick="triggerTrade('BUY', 'CALL', '{strk}')">[B]</button>
                     <button class="btn-act btn-s" onclick="triggerTrade('SELL', 'CALL', '{strk}')">[S]</button>
                 </div>
@@ -890,7 +908,7 @@ with panel_col1:
             oi_m = ce["OI"] / 10000000
             oi_pct = min(100.0, (ce["OI"] / max_oi_val) * 100.0)
             ce_oi_cell = f"""
-            <td>
+            <td class="{oi_ce_cls}">
                 <div class="oi-bar-container">
                     <div class="oi-bar-fill" style="background-color: rgba(16, 185, 129, 0.25); width: {oi_pct}%; right: 0;"></div>
                     <span style="position: relative; z-index: 5; font-size: 0.72rem; color: #10b981;">{oi_m:.2f}Cr</span>
@@ -898,10 +916,11 @@ with panel_col1:
             </td>
             """
         else:
-            ce_ltp_cell = "<td>-</td>"
-            ce_oi_cell = "<td>-</td>"
+            ce_ltp_cell = f'<td class="{ce_cls}">-</td>'
+            ce_oi_cell = f'<td class="{oi_ce_cls}">-</td>'
 
         # Put LTP cell
+        pe_lots = int(pe_qty / lot_sz) if pe_qty > 0 else 1
         if pe is not None:
             pe_delta_lbl = f"({pe.Delta:.2f})" if "Delta" in pe_r.columns and not np.isnan(pe.Delta) else ""
             pe_badge = ""
@@ -911,6 +930,7 @@ with panel_col1:
             <td class="hover-cell {pe_cls}" oncontextmenu="event.preventDefault(); triggerTrade('DESELECT', 'PUT', '{strk}');">
                 <span>₹{pe.LTP:.2f} {pe_delta_lbl}</span>{pe_badge}
                 <div class="hover-actions">
+                    <span style="font-size: 11px; font-weight: 800; color: #1e293b; margin-right: 4px;">{pe_lots}</span>
                     <button class="btn-act btn-b" onclick="triggerTrade('BUY', 'PUT', '{strk}')">[B]</button>
                     <button class="btn-act btn-s" onclick="triggerTrade('SELL', 'PUT', '{strk}')">[S]</button>
                 </div>
@@ -921,7 +941,7 @@ with panel_col1:
             oi_m = pe["OI"] / 10000000
             oi_pct = min(100.0, (pe["OI"] / max_oi_val) * 100.0)
             pe_oi_cell = f"""
-            <td>
+            <td class="{oi_pe_cls}">
                 <div class="oi-bar-container">
                     <div class="oi-bar-fill" style="background-color: rgba(239, 68, 68, 0.25); width: {oi_pct}%; left: 0;"></div>
                     <span style="position: relative; z-index: 5; font-size: 0.72rem; color: #ef4444;">{oi_m:.2f}Cr</span>
@@ -929,8 +949,8 @@ with panel_col1:
             </td>
             """
         else:
-            pe_ltp_cell = "<td>-</td>"
-            pe_oi_cell = "<td>-</td>"
+            pe_ltp_cell = f'<td class="{pe_cls}">-</td>'
+            pe_oi_cell = f'<td class="{oi_pe_cls}">-</td>'
 
         row_html = f"""
         <tr>
