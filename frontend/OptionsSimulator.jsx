@@ -52,7 +52,6 @@ export default function OptionsSimulator() {
   const getExpiryList = () => {
     const list = [];
     const baseDate = new Date();
-    // Move base date to standard Wednesday/Thursday
     const targetWd = symbol === 'FINNIFTY' ? 2 : (symbol === 'BANKNIFTY' ? 3 : 4);
     const currentWd = baseDate.getDay();
     const diff = (targetWd - currentWd + 7) % 7;
@@ -62,7 +61,6 @@ export default function OptionsSimulator() {
       const d = new Date(anchor);
       d.setDate(anchor.getDate() + offset * 7);
 
-      // Automatically shift to preceding valid trading day if holiday hit (e.g. Independence Day Aug 15)
       if (d.getMonth() === 7 && d.getDate() === 15) {
         d.setDate(d.getDate() - 1);
       }
@@ -79,11 +77,13 @@ export default function OptionsSimulator() {
   useEffect(() => {
     const S = symbol === 'BANKNIFTY' ? 52000 : (symbol === 'FINNIFTY' ? 23000 : 25000);
     const step = symbol === 'BANKNIFTY' ? 100 : 50;
+
+    // Dynamic ATM recalibration based on closest strike to spot S
     const atm = Math.round(S / step) * step;
 
-    // Generate strikes: ATM ± 15 strikes
+    // Generate strikes: ATM ± 10 strikes to show exactly 21 strikes
     const strikes = [];
-    for (let i = -15; i <= 15; i++) {
+    for (let i = -10; i <= 10; i++) {
         strikes.push(atm + i * step);
     }
 
@@ -127,7 +127,7 @@ export default function OptionsSimulator() {
     setMetadata({
         spot_price: S,
         day_open: S - 120.0,
-        futures_price: S + 15.0,
+        futures_price: Number((S * Math.exp(0.065 * 0.01)).toFixed(2)),
         synthetic_futures: S + 2.5,
         straddle_premium: 245.0,
         atm_iv: 16.5,
@@ -155,28 +155,28 @@ export default function OptionsSimulator() {
     }
   }
 
-  // Toggle/Deselect Leg Mechanism
-  const handleTradeToggle = (side, right, strike, price) => {
-    // Check if the exact leg is already active
+  // Click lot accumulation & right-click deselect mechanics
+  const handleTradeAccumulate = (side, right, strike, price) => {
     const matchIndex = activePositions.findIndex(
       pos => pos.strike === strike && pos.right === right && pos.side === side
     );
 
     if (matchIndex !== -1) {
-      // Toggle off -> remove instantly
-      const updated = activePositions.filter((_, idx) => idx !== matchIndex);
+      // Accumulate 50 more quantity (1 lot)
+      const updated = [...activePositions];
+      updated[matchIndex].qty += 50;
       setActivePositions(updated);
 
       const log = {
         time: new Date().toLocaleTimeString(),
-        action: `TOGGLE_OFF ${side} ${right}`,
+        action: `ACCUMULATE ${side} ${right} (+1 Lot)`,
         strike,
-        qty: activePositions[matchIndex].qty,
+        qty: updated[matchIndex].qty,
         premium: price
       };
       setTradeLogs(prev => [log, ...prev]);
     } else {
-      // Toggle on -> select/add instantly (default to 1 lot i.e. 50 qty)
+      // Create new position with 1 lot (50 qty)
       const newLeg = {
         id: String(Date.now() + Math.random()),
         side,
@@ -189,13 +189,28 @@ export default function OptionsSimulator() {
 
       const log = {
         time: new Date().toLocaleTimeString(),
-        action: `${side} ${right}`,
+        action: `NEW_LEG ${side} ${right}`,
         strike,
         qty: 50,
         premium: price
       };
       setTradeLogs(prev => [log, ...prev]);
     }
+  };
+
+  const handleRightClickDeselect = (e, right, strike) => {
+    e.preventDefault();
+    const updated = activePositions.filter(p => !(p.strike === strike && p.right === right));
+    setActivePositions(updated);
+
+    const log = {
+      time: new Date().toLocaleTimeString(),
+      action: `DESELECT_RIGHTCLICK ${right}`,
+      strike,
+      qty: 0,
+      premium: 0
+    };
+    setTradeLogs(prev => [log, ...prev]);
   };
 
   const updatePositionQty = (id, newQty) => {
@@ -442,9 +457,11 @@ export default function OptionsSimulator() {
                         className={`grid grid-cols-11 text-center text-xs py-2.5 border-b border-slate-800/40 items-center transition relative group ${row.is_atm ? 'bg-emerald-950/15 border-y border-emerald-500/20' : 'hover:bg-slate-900/30'}`}
                       >
                         {/* Call Side LTP with Hover-Based Order Buttons & Active position Badge */}
-                        <div className="col-span-2 font-mono flex items-center justify-center h-8 relative">
+                        <div
+                          className="col-span-2 font-mono flex items-center justify-center h-8 relative hover-cell"
+                          onContextMenu={(e) => handleRightClickDeselect(e, 'CALL', row.strike)}
+                        >
                           {activeCallPos ? (
-                            // Display ONLY a compact action and lot badge (e.g. B (1x)) once added
                             <span className={`px-2.5 py-1 rounded text-xs font-extrabold ${activeCallPos.side === 'BUY' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-400 border border-rose-500/40'}`}>
                               {activeCallPos.side === 'BUY' ? 'B' : 'S'} ({Math.round(activeCallPos.qty / 50)}x)
                             </span>
@@ -457,16 +474,16 @@ export default function OptionsSimulator() {
                           {/* Hover buy/sell triggers: Display B/S ONLY when hovered directly over Call LTP cell */}
                           <div className="absolute inset-0 flex items-center justify-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity bg-slate-950 rounded-r z-10">
                             <button
-                              onClick={() => handleTradeToggle('BUY', 'CALL', row.strike, row.call.ltp)}
-                              className={`px-3 py-1 rounded font-bold text-xs ${activeCallPos && activeCallPos.side === 'BUY' ? 'bg-amber-600 text-slate-100' : 'bg-blue-600 hover:bg-blue-500 text-slate-100'}`}
+                              onClick={() => handleTradeAccumulate('BUY', 'CALL', row.strike, row.call.ltp)}
+                              className="px-3 py-1 rounded font-bold text-xs bg-blue-600 hover:bg-blue-500 text-slate-100"
                             >
-                              {activeCallPos && activeCallPos.side === 'BUY' ? 'Deselect' : 'B'}
+                              B
                             </button>
                             <button
-                              onClick={() => handleTradeToggle('SELL', 'CALL', row.strike, row.call.ltp)}
-                              className={`px-3 py-1 rounded font-bold text-xs ${activeCallPos && activeCallPos.side === 'SELL' ? 'bg-amber-600 text-slate-100' : 'bg-rose-600 hover:bg-rose-500 text-slate-100'}`}
+                              onClick={() => handleTradeAccumulate('SELL', 'CALL', row.strike, row.call.ltp)}
+                              className="px-3 py-1 rounded font-bold text-xs bg-rose-600 hover:bg-rose-500 text-slate-100"
                             >
-                              {activeCallPos && activeCallPos.side === 'SELL' ? 'Deselect' : 'S'}
+                              S
                             </button>
                           </div>
                         </div>
@@ -493,9 +510,11 @@ export default function OptionsSimulator() {
                         </div>
 
                         {/* Put Side LTP with Hover-Based Order Buttons & Active position Badge */}
-                        <div className="col-span-2 font-mono flex items-center justify-center h-8 relative">
+                        <div
+                          className="col-span-2 font-mono flex items-center justify-center h-8 relative hover-cell"
+                          onContextMenu={(e) => handleRightClickDeselect(e, 'PUT', row.strike)}
+                        >
                           {activePutPos ? (
-                            // Display ONLY a compact action and lot badge (e.g. B (1x)) once added
                             <span className={`px-2.5 py-1 rounded text-xs font-extrabold ${activePutPos.side === 'BUY' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-400 border border-rose-500/40'}`}>
                               {activePutPos.side === 'BUY' ? 'B' : 'S'} ({Math.round(activePutPos.qty / 50)}x)
                             </span>
@@ -508,16 +527,16 @@ export default function OptionsSimulator() {
                           {/* Hover buy/sell triggers: Display B/S ONLY when hovered directly over Put LTP cell */}
                           <div className="absolute inset-0 flex items-center justify-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity bg-slate-950 rounded-l z-10">
                             <button
-                              onClick={() => handleTradeToggle('BUY', 'PUT', row.strike, row.put.ltp)}
-                              className={`px-3 py-1 rounded font-bold text-xs ${activePutPos && activePutPos.side === 'BUY' ? 'bg-amber-600 text-slate-100' : 'bg-blue-600 hover:bg-blue-500 text-slate-100'}`}
+                              onClick={() => handleTradeAccumulate('BUY', 'PUT', row.strike, row.put.ltp)}
+                              className="px-3 py-1 rounded font-bold text-xs bg-blue-600 hover:bg-blue-500 text-slate-100"
                             >
-                              {activePutPos && activePutPos.side === 'BUY' ? 'Deselect' : 'B'}
+                              B
                             </button>
                             <button
-                              onClick={() => handleTradeToggle('SELL', 'PUT', row.strike, row.put.ltp)}
-                              className={`px-3 py-1 rounded font-bold text-xs ${activePutPos && activePutPos.side === 'SELL' ? 'bg-amber-600 text-slate-100' : 'bg-rose-600 hover:bg-rose-500 text-slate-100'}`}
+                              onClick={() => handleTradeAccumulate('SELL', 'PUT', row.strike, row.put.ltp)}
+                              className="px-3 py-1 rounded font-bold text-xs bg-rose-600 hover:bg-rose-500 text-slate-100"
                             >
-                              {activePutPos && activePutPos.side === 'SELL' ? 'Deselect' : 'S'}
+                              S
                             </button>
                           </div>
                         </div>
@@ -575,9 +594,8 @@ export default function OptionsSimulator() {
                                 </td>
                                 <td className="p-3 font-mono">₹{pos.premium}</td>
                                 <td className="p-3">
-                                  {/* Interactive Deselect Toggle button */}
                                   <button
-                                    onClick={() => handleTradeToggle(pos.side, pos.right, pos.strike, pos.premium)}
+                                    onClick={() => handleRightClickDeselect({ preventDefault: () => {} }, pos.right, pos.strike)}
                                     className="p-1 bg-rose-950/50 hover:bg-rose-900 text-rose-300 border border-rose-800/40 rounded transition"
                                   >
                                     Deselect
@@ -629,7 +647,7 @@ export default function OptionsSimulator() {
                   )}
                 </div>
 
-                {/* Expiry Payoff Graph Container: ONE Unified payoff curve with green/red shade zones & dynamic overlay */}
+                {/* Expiry Payoff Graph Container */}
                 <div className="bg-slate-900/30 border border-slate-800 rounded-xl p-5 space-y-4">
                   <h3 className="text-sm font-bold text-slate-200 flex items-center space-x-1.5">
                     <TrendingUp className="h-4 w-4 text-emerald-400" />
@@ -645,20 +663,11 @@ export default function OptionsSimulator() {
                       <span className="flex items-center"><span className="h-0.5 w-6 border-b border-dashed border-sky-400 mr-1.5" /> Today's MTM (T+t dashed)</span>
                     </div>
 
-                    {/* High-fidelity Vector Representation of the Consolidated Chart */}
                     <svg className="w-full max-w-2xl h-40 text-emerald-500 pointer-events-none" viewBox="0 0 400 100" preserveAspectRatio="none">
-                      {/* Zero P&L baseline */}
                       <line x1="0" y1="50" x2="400" y2="50" stroke="#475569" strokeWidth="1" />
-
-                      {/* Shaded profit zone */}
                       <path d="M 0,50 Q 100,5 200,50 Q 300,95 400,50 Z" fill="rgba(34, 197, 94, 0.2)" />
-                      {/* Shaded loss zone */}
                       <path d="M 0,50 Q 100,95 200,50 Q 300,5 400,50 Z" fill="rgba(239, 68, 68, 0.2)" />
-
-                      {/* Expiration line (solid) */}
                       <path d="M 0,50 Q 100,10 200,50 Q 300,90 400,50" fill="none" stroke="#22c55e" strokeWidth="2.5" />
-
-                      {/* T+t line (dashed) */}
                       <path d="M 0,45 Q 100,20 200,50 Q 300,80 400,55" fill="none" stroke="#38bdf8" strokeWidth="2" strokeDasharray="4 4" />
                     </svg>
                   </div>

@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import calendar
+import uuid
 from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
 from breeze_client import BreezeClient, format_breeze_date
@@ -96,7 +97,6 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
     else:
         session = st.session_state.get("session_token")
         if not is_real_session_token(session):
-            # Skip REST call if not authenticated or session token is placeholder/mock
             return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
         try:
             start_iso = f"{selected_day}T09:15:00.000Z"
@@ -112,7 +112,6 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
                 best_row = df.loc[df["diff"].idxmin()]
                 return float(best_row["close"])
         except Exception as e:
-            # Output silently to terminal logs instead of rendering yellow st.warning banner in the UI
             print(f"Failed to fetch auto-spot price from Breeze: {e}. Using fallback.")
         return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
 
@@ -131,59 +130,6 @@ def get_strike_position_info(strike, right):
                 net_qty -= q
                 sells += q
     return net_qty, buys, sells
-
-def toggle_chain_trade(strike, right, side, ltp, qty, chain_sl, chain_tp, times, idx):
-    match_pos = None
-    for p in st.session_state.positions:
-        if p["strike"] == float(strike) and p["right"].upper() == right.upper() and p["side"].upper() == side.upper():
-            match_pos = p
-            break
-
-    if match_pos is not None:
-        # Deselect / remove
-        st.session_state.positions.remove(match_pos)
-        if side.upper() == "BUY":
-            st.session_state.cash += match_pos["qty"] * match_pos["avg"]
-        else:
-            st.session_state.cash -= match_pos["qty"] * match_pos["avg"]
-
-        st.session_state.trade_history.append({
-            "time": pd.Timestamp(times[idx]),
-            "action": f"TOGGLE_OFF ({side.upper()}_{right.upper()})",
-            "right": right.upper(),
-            "strike": float(strike),
-            "qty": match_pos["qty"],
-            "price": float(ltp),
-            "realized": 0.0
-        })
-    else:
-        # Select / add
-        new_pos = {
-            "id": str(uuid.uuid4()),
-            "right": right.upper(),
-            "strike": float(strike),
-            "side": side.upper(),
-            "qty": int(qty),
-            "avg": float(ltp),
-            "sl_pct": float(chain_sl) if chain_sl > 0 else None,
-            "tp_pct": float(chain_tp) if chain_tp > 0 else None,
-            "entry_time": str(pd.Timestamp(times[idx]))
-        }
-        st.session_state.positions.append(new_pos)
-        if side.upper() == "BUY":
-            st.session_state.cash -= int(qty) * float(ltp)
-        else:
-            st.session_state.cash += int(qty) * float(ltp)
-
-        st.session_state.trade_history.append({
-            "time": pd.Timestamp(times[idx]),
-            "action": f"{side.upper()} ({right.upper()})",
-            "right": right.upper(),
-            "strike": float(strike),
-            "qty": int(qty),
-            "price": float(ltp),
-            "realized": 0.0
-        })
 
 from backend.math_engine import black_scholes_pricing
 
@@ -251,8 +197,8 @@ def draw_consolidated_payoff_chart(active_legs, spot, step, T, rate, div):
         name="Today's MTM (T+t)"
     ))
 
-    fig.add_vline(x=spot, line_dash="dot", line_color="#f97316", line_width=2, annotation_text="Spot", annotation_position="top left")
-    fig.add_hline(y=0, line_dash="solid", line_color="#475569", line_width=1)
+    fig.add_vline(x=spot, line_dash="dot", line_color="#f97316", width=2, annotation_text="Spot", annotation_position="top left")
+    fig.add_hline(y=0, line_dash="solid", line_color="#475569", width=1)
 
     fig.update_layout(
         title="Consolidated Strategy Payoff & Today's MTM Chart (StockMock Style)",
@@ -266,8 +212,6 @@ def draw_consolidated_payoff_chart(active_legs, spot, step, T, rate, div):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     return fig
-
-import uuid
 
 def current_quotes(view):
     return {(str(r.Right),float(r.Strike)):float(r.LTP) for _,r in view.iterrows()}
@@ -413,8 +357,30 @@ div.stButton > button:first-child {
 div.stButton > button:first-child:hover {
     transform: scale(1.05);
 }
+div[data-testid="stTextInput"]:has(input[placeholder="HiddenTradeSignalInput"]) {
+    display: none !important;
+}
 </style>
 """,unsafe_allow_html=True)
+
+# PostMessage Cross-Origin Communications Listener:
+# Allows custom HTML iframe components to securely notify and update the main parent Streamlit context
+st.markdown("""
+<script>
+window.addEventListener("message", (event) => {
+    const actionStr = event.data;
+    if (typeof actionStr === "string" && (actionStr.startsWith("BUY:") || actionStr.startsWith("SELL:") || actionStr.startsWith("DESELECT:"))) {
+        const input = window.parent.document.querySelector('input[placeholder="HiddenTradeSignalInput"]');
+        if (input) {
+            input.value = actionStr;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+});
+</script>
+""", unsafe_allow_html=True)
+
 st.title("📈 Breeze Option Replay")
 st.caption("Historical paper-trading simulator • every paper fill is replay-time stamped • no live orders")
 
@@ -434,7 +400,6 @@ client = BreezeClient(
 )
 
 # ---------- auto-connect & token exchange ----------
-# Capture any common parameter names returned by redirect URL: "api_session", "apisession", "API_Session", "session_token", "token"
 api_session = None
 for param_name in ["API_Session", "api_session", "apisession", "session_token", "token"]:
     if param_name in st.query_params:
@@ -459,12 +424,6 @@ with st.container(border=True):
     selected_time=d.time_input("Replay time",time(9,15),step=300)
     interval=e.selectbox("Bar interval",["1minute","5minute","15minute","30minute","1day"],index=1)
     step=f.number_input("Strike step",5.0,step=50.0,value=50.0)
-
-# AutoPlay state setup if missing
-if "autoplay" not in st.session_state:
-    st.session_state.autoplay = False
-if "autoplay_speed" not in st.session_state:
-    st.session_state.autoplay_speed = 1.0
 
 with st.sidebar:
     st.header("🔐 Connection")
@@ -518,7 +477,6 @@ with st.sidebar:
 # ---------- auto-calculate spot price ----------
 current_params_key = f"{symbol}_{mode}_{selected_day}_{selected_time}"
 if st.session_state.get("last_params_key") != current_params_key:
-    # Trigger auto spot update
     auto_spot = get_spot_price(client, symbol, selected_day, selected_time, mode)
     st.session_state["atm_strike_val"] = auto_spot
     st.session_state["last_params_key"] = current_params_key
@@ -534,12 +492,10 @@ with st.container(border=True):
     atm = m1.number_input("ATM strike", 1000.0, step=50.0, value=float(st.session_state["atm_strike_val"]))
     st.session_state["atm_strike_val"] = atm
 
-    strike_count = m2.slider("Strikes", 4, 20, 20)
+    strike_count = m2.slider("Strikes", 4, 40, 40)
 
-    # Expiry is a selectbox dynamically calculated directly from the Broker Security Master!
     expiry_options = get_official_expiry_dates(selected_day, symbol, client)
 
-    # Find active expiry (closest on or after selected_day)
     default_expiry_index = 0
     for idx_exp, exp in enumerate(expiry_options):
         if exp >= selected_day:
@@ -562,7 +518,6 @@ with st.container(border=True):
                 st.error("Connect Breeze first.")
                 chain, times = pd.DataFrame(), []
             else:
-                # Breeze API Strict ISO Date Formatting with Trading Hours
                 start_iso = f"{selected_day.strftime('%Y-%m-%d')}T09:15:00.000Z"
                 end_iso = f"{selected_day.strftime('%Y-%m-%d')}T15:30:00.000Z"
                 exp_iso = f"{expiry_date.strftime('%Y-%m-%d')}T07:00:00.000Z"
@@ -592,7 +547,6 @@ with st.container(border=True):
                 chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
 
-                # Dynamic fallback loader: if real data is empty, fall back to simulated chain with clear toast
                 if chain.empty:
                     st.toast("⚠️ Breeze API returned empty chain for this contract date. Gracefully loading un-cached high-fidelity simulated Option Chain.", icon="💡")
                     chain, times = demo_chain(atm, step, strike_count, selected_day)
@@ -603,7 +557,6 @@ with st.container(border=True):
         st.session_state.chain = chain
         st.session_state.times = times
 
-        # Select nearest available timestamp to requested time
         target = pd.Timestamp(datetime.combine(selected_day, selected_time))
         if len(times) > 0:
             st.session_state.idx = int(np.argmin([abs(pd.Timestamp(x) - target) for x in times]))
@@ -613,11 +566,9 @@ chain=st.session_state.get("chain",pd.DataFrame()); times=st.session_state.get("
 if chain.empty:
     st.info("Choose a date/time and expiry, then click Load / Generate Chain."); st.stop()
 
-# Display dynamic fallback badge if active to explain the state clearly
 if st.session_state.get("breeze_fallback_active", False):
     st.info("💡 **Replay Engine Status**: Real ICICI Securities historical options database was empty for this specific date/expiry. Un-cached simulated Option Chain loaded so you can continuously trade and replay.")
 
-# Let's ensure times is not a DatetimeIndex but a plain list/sequence to avoid truth value ambiguity
 if hasattr(times, "tolist"):
     times = times.tolist()
 
@@ -626,7 +577,6 @@ idx=min(st.session_state.get("idx",0),len(times)-1)
 # Ensure AutoPlay continues running if active
 import time as ptime
 if st.session_state.autoplay:
-    # Trigger next bar if possible
     if idx < len(times) - 1:
         time_to_wait = 1.0 / max(0.1, st.session_state.autoplay_speed)
         ptime.sleep(time_to_wait)
@@ -647,6 +597,9 @@ rt=pd.Timestamp(times[idx]) if times else pd.Timestamp(selected_day)
 rt=rt.tz_localize("UTC") if rt.tzinfo is None else rt.tz_convert("UTC")
 T=max((expiry_dt-rt).total_seconds()/(365*24*3600),1e-8)
 
+# Calculate dynamic Future Price using cost of carry math
+future_price = spot * np.exp(rate * T)
+
 # Calculate quotes & check triggers
 out=[]
 for _,r in snap.iterrows():
@@ -659,7 +612,7 @@ if out:
 else:
     view=pd.DataFrame(columns=["Strike","Right","LTP","Volume","OI","IV %","Delta","Gamma","Theta","Vega","Rho"])
 
-# Define quotes for global use (e.g. exit/square-off actions)
+# Define quotes for global use
 quotes = current_quotes(view)
 
 # Risk check
@@ -670,7 +623,6 @@ if times:
 
 # --- HEADER: Account metrics & AutoPlay controls ---
 st.markdown("---")
-# Row 1: Key Performance Metrics
 portfolio, pos_value = mark_portfolio(view)
 current_capital = st.session_state.cash + pos_value
 initial_capital = 1_000_000.0
@@ -681,12 +633,98 @@ if times:
     st.session_state.mtm_history.append({"time":pd.Timestamp(times[idx]),"mtm":total_pnl})
 mh=pd.DataFrame(st.session_state.mtm_history).drop_duplicates("time").sort_values("time") if st.session_state.mtm_history else pd.DataFrame(columns=["time", "mtm"])
 
-met1, met2, met3, met4, met5 = st.columns(5)
+met1, met2, met3, met4, met5, met6 = st.columns(6)
 met1.metric("Capital", f"₹{current_capital:,.2f}")
 met2.metric("Portfolio Value", f"₹{pos_value:,.2f}")
 met3.metric("Free Cash", f"₹{st.session_state.cash:,.2f}")
 met4.metric("Total MTM P&L", f"₹{total_pnl:,.2f}", delta=f"₹{total_pnl:,.2f}")
-met5.metric("Current Spot Price", f"₹{spot:,.2f}")
+met5.metric("Spot Price", f"₹{spot:,.2f}")
+met6.metric("Future Price", f"₹{future_price:,.2f}")
+
+# Hidden action dispatcher text input for JS communication
+action_input = st.text_input("HiddenTradeSignalInput", key="action_input", placeholder="HiddenTradeSignalInput", label_visibility="collapsed")
+
+if action_input:
+    # Clear input first and parse immediately
+    action = action_input
+    parts = action.split(":")
+    if len(parts) == 3:
+        cmd, right_str, strike_str = parts
+        strike_val = float(strike_str)
+        right_val = right_str.upper()
+
+        if cmd == "DESELECT":
+            # Refund cash cleanly
+            for p in st.session_state.positions:
+                if p["strike"] == strike_val and p["right"].upper() == right_val:
+                    if p["side"] == "BUY":
+                        st.session_state.cash += p["qty"] * p["avg"]
+                    else:
+                        st.session_state.cash -= p["qty"] * p["avg"]
+            st.session_state.positions = [p for p in st.session_state.positions if not (p["strike"] == strike_val and p["right"].upper() == right_val)]
+
+            st.session_state.trade_history.append({
+                "time": pd.Timestamp(times[idx]) if times else pd.Timestamp(selected_day),
+                "action": f"DESELECT ({right_val})",
+                "right": right_val,
+                "strike": strike_val,
+                "qty": 0,
+                "price": 0.0,
+                "realized": 0.0
+            })
+            st.rerun()
+
+        elif cmd in ["BUY", "SELL"]:
+            # Find matching active position to accumulate lots
+            match_pos = None
+            for p in st.session_state.positions:
+                if p["strike"] == strike_val and p["right"].upper() == right_val and p["side"].upper() == cmd:
+                    match_pos = p
+                    break
+
+            # Find price of that option in view
+            ltp_val = 0.0
+            for _, r_view in view.iterrows():
+                if r_view.Strike == strike_val and r_view.Right == right_val:
+                    ltp_val = float(r_view.LTP)
+                    break
+
+            if match_pos:
+                # Accumulate quantity (+1 lot = 50 qty)
+                match_pos["qty"] += 50
+                if cmd == "BUY":
+                    st.session_state.cash -= 50 * ltp_val
+                else:
+                    st.session_state.cash += 50 * ltp_val
+            else:
+                # Add new position (1 lot = 50 qty)
+                new_pos = {
+                    "id": str(uuid.uuid4()),
+                    "right": right_val,
+                    "strike": strike_val,
+                    "side": cmd,
+                    "qty": 50,
+                    "avg": ltp_val,
+                    "sl_pct": None,
+                    "tp_pct": None,
+                    "entry_time": str(pd.Timestamp(times[idx])) if times else str(selected_day)
+                }
+                st.session_state.positions.append(new_pos)
+                if cmd == "BUY":
+                    st.session_state.cash -= 50 * ltp_val
+                else:
+                    st.session_state.cash += 50 * ltp_val
+
+            st.session_state.trade_history.append({
+                "time": pd.Timestamp(times[idx]) if times else pd.Timestamp(selected_day),
+                "action": f"{cmd} ({right_val})",
+                "right": right_val,
+                "strike": strike_val,
+                "qty": 50,
+                "price": ltp_val,
+                "realized": 0.0
+            })
+            st.rerun()
 
 # Row 2: Replay controls & AutoPlay bar
 con1, con2 = st.columns([3, 2])
@@ -695,7 +733,7 @@ with con1:
     j1,j2,j3,j4,j5,j6,j7 = st.columns(7)
     if j1.button("⏮ 1 bar", key="b1"): st.session_state.idx=move_index(times,idx,-1); st.rerun()
     if j2.button("1 bar ⏭", key="b2"): st.session_state.idx=move_index(times,idx,1); st.rerun()
-    if j3.button("⏪ 5m", key="b3"): st.session_state.idx=move_index(times,idx,-1); st.rerun() # demo_chain produces 5m interval
+    if j3.button("⏪ 5m", key="b3"): st.session_state.idx=move_index(times,idx,-1); st.rerun()
     if j4.button("5m ⏩", key="b4"): st.session_state.idx=move_index(times,idx,1); st.rerun()
     if j5.button("⏪ 30m", key="b5"): st.session_state.idx=move_index(times,idx,-6); st.rerun()
     if j6.button("30m ⏩", key="b6"): st.session_state.idx=move_index(times,idx,6); st.rerun()
@@ -723,7 +761,6 @@ tab_terminal, tab_positions = st.tabs(["📊 Option Terminal & Strategy Builder"
 
 # ---------- TAB 1: Option Terminal & Strategy Builder ----------
 with tab_terminal:
-    # Beautiful top-aligned simulation status card with full formatted datetime
     if times:
         session_ts = pd.Timestamp(times[idx])
         formatted_session_time = session_ts.strftime("%d-%b-%Y %I:%M %p")
@@ -741,121 +778,254 @@ with tab_terminal:
         """, unsafe_allow_html=True)
 
     # Option Chain Section
-    st.subheader("📈 Interactive Option Chain")
-    st.caption("Execute trades instantly. You can set individual Stop-Loss (SL) and Take-Profit (TP) percentages before buying or selling.")
+    st.subheader("📈 Premium Option Chain (StockMock Style)")
+    st.caption("No fixed buttons. Hover CE LTP, PE LTP or Strike to display Buy (B) and Sell (S) controls. Left-click to accumulate lots (+50 qty per click). Right-click any cell to deselect option.")
 
-    # Global execution inputs
-    chain_exec1, chain_exec2, chain_exec3 = st.columns([1, 1, 1])
-    chain_qty = chain_exec1.number_input("Trade Quantity (Lots)", 25, 100000, 50, step=25)
-    chain_sl = chain_exec2.number_input("Default Stop Loss % (0 to disable)", 0.0, 100.0, 0.0, step=1.0)
-    chain_tp = chain_exec3.number_input("Default Take Profit % (0 to disable)", 0.0, 100.0, 0.0, step=1.0)
+    # 1. Calculate nearest ATM strike dynamically as the replay moves through spot prices
+    nearest_atm = round(round(spot / step) * step, 2)
 
-    # Option chain grid header
-    header=st.columns([1, 1.2, 1.2, 1.2, 1.2, 1.2, 1, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2])
-    labels = ["BUY CE", "SELL CE", "CE LTP", "CE IV", "CE Δ", "CE Θ", "Strike", "PE LTP", "PE IV", "PE Δ", "PE Θ", "BUY PE", "SELL PE"]
-    for col, label in zip(header, labels):
-        col.markdown(f"<div style='text-align: center; font-weight: bold;'>{label}</div>", unsafe_allow_html=True)
+    # 2. Slice exactly 21 strikes centered around the active ATM strike
+    active_strikes = sorted(round(nearest_atm + (i - 10) * step, 2) for i in range(21))
 
-    for strike in sorted(view.Strike.unique()):
-        ce=view[(view.Strike==strike)&(view.Right=="CALL")]; pe=view[(view.Strike==strike)&(view.Right=="PUT")]
-        ce=ce.iloc[0] if not ce.empty else None; pe=pe.iloc[0] if not pe.empty else None
+    # Filter the Option Chain view based on these 21 strikes
+    sliced_view = view[view.Strike.isin(active_strikes)].sort_values(["Strike", "Right"])
 
-        # Calculate positions
+    # CSS stylesheet and javascript communication payload injected inline
+    html_elements = []
+    html_elements.append("""
+    <style>
+    .mock-table {
+        width: 100%;
+        border-collapse: collapse;
+        background-color: #0b0f19;
+        color: #e2e8f0;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        border-radius: 8px;
+        overflow: hidden;
+    }
+    .mock-table th {
+        background-color: #0f172a;
+        color: #94a3b8;
+        font-size: 0.75rem;
+        font-weight: 700;
+        padding: 12px 8px;
+        text-transform: uppercase;
+        border-bottom: 2px solid #1e293b;
+    }
+    .mock-table td {
+        padding: 10px 8px;
+        border-bottom: 1px solid #1e293b;
+        text-align: center;
+        font-size: 0.85rem;
+        position: relative;
+    }
+    .mock-table tr:hover {
+        background-color: #1e293b40;
+    }
+    .itm-ce {
+        background-color: #fbbf240d !important;
+    }
+    .itm-pe {
+        background-color: #c084fc0d !important;
+    }
+    .hover-cell {
+        cursor: pointer;
+        transition: background-color 0.2s;
+    }
+    .hover-cell:hover {
+        background-color: #1e293b80;
+    }
+    .hover-actions {
+        position: absolute;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        background-color: rgba(15, 23, 42, 0.95);
+        z-index: 20;
+    }
+    .hover-cell:hover .hover-actions {
+        display: flex;
+    }
+    .btn-act {
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-weight: bold;
+        font-size: 0.75rem;
+        border: none;
+        cursor: pointer;
+        color: white;
+        transition: transform 0.1s;
+    }
+    .btn-act:active {
+        transform: scale(0.95);
+    }
+    .btn-b {
+        background-color: #2563eb;
+    }
+    .btn-s {
+        background-color: #dc2626;
+    }
+    .badge-act {
+        display: inline-block;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.7rem;
+        font-weight: bold;
+        margin-top: 4px;
+    }
+    .badge-b {
+        background-color: rgba(34, 197, 94, 0.2);
+        color: #22c55e;
+        border: 1px solid rgba(34, 197, 94, 0.4);
+    }
+    .badge-s {
+        background-color: rgba(239, 68, 68, 0.2);
+        color: #ef4444;
+        border: 1px solid rgba(239, 68, 68, 0.4);
+    }
+    .strike-atm {
+        background-color: #020617;
+        border: 2px solid #22c55e !important;
+        color: #38bdf8 !important;
+        font-weight: 800;
+        font-size: 1.05rem;
+    }
+    .strike-standard {
+        background-color: #1e293b;
+        color: #38bdf8;
+        font-weight: bold;
+    }
+    </style>
+    <script>
+    function dispatchAction(actionStr) {
+        window.parent.postMessage(actionStr, "*");
+    }
+    </script>
+    """)
+
+    html_elements.append("""
+    <table class="mock-table">
+        <thead>
+            <tr>
+                <th>CE IV</th>
+                <th>CE Delta</th>
+                <th>CE LTP (Hover to trade)</th>
+                <th style="width: 14%;">Strike</th>
+                <th>PE LTP (Hover to trade)</th>
+                <th>PE Delta</th>
+                <th>PE IV</th>
+            </tr>
+        </thead>
+        <tbody>
+    """)
+
+    for strike in active_strikes:
+        ce_row = sliced_view[(sliced_view.Strike == strike) & (sliced_view.Right == "CALL")]
+        pe_row = sliced_view[(sliced_view.Strike == strike) & (sliced_view.Right == "PUT")]
+
+        ce = ce_row.iloc[0] if not ce_row.empty else None
+        pe = pe_row.iloc[0] if not pe_row.empty else None
+
         ce_net, ce_b, ce_s = get_strike_position_info(strike, "CALL")
         pe_net, pe_b, pe_s = get_strike_position_info(strike, "PUT")
 
         ce_is_itm = (strike < spot)
         pe_is_itm = (strike > spot)
 
-        cols = st.columns([1, 1.2, 1.2, 1.2, 1.2, 1.2, 1, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2])
+        ce_class = "itm-ce" if ce_is_itm else ""
+        pe_class = "itm-pe" if pe_is_itm else ""
 
-        # CE buttons (Acting as dynamic Toggle Switches!)
+        strike_class = "strike-atm" if abs(strike - spot) <= step * 0.51 else "strike-standard"
+
+        # Build Call LTP Cell
+        ce_ltp_html = ""
         if ce is not None:
-            # BUY CE Toggle Button
-            buy_ce_label = "UNBUY" if ce_b > 0 else "BUY"
-            if cols[0].button(buy_ce_label, key=f"bce{strike}", use_container_width=True):
-                toggle_chain_trade(strike, "CALL", "BUY", ce.LTP, chain_qty, chain_sl, chain_tp, times, idx)
-                st.rerun()
-
-            # SELL CE Toggle Button
-            sell_ce_label = "UNSELL" if ce_s > 0 else "SELL"
-            if cols[1].button(sell_ce_label, key=f"sce{strike}", use_container_width=True):
-                toggle_chain_trade(strike, "CALL", "SELL", ce.LTP, chain_qty, chain_sl, chain_tp, times, idx)
-                st.rerun()
-
-            # CE LTP cell styling with dynamic In-The-Money highlighting & net quantity display
-            if ce_is_itm:
-                ce_ltp_html = f"<div style='text-align: center; background-color: #fbbf2415; border: 1px solid #fbbf2440; border-radius: 4px; padding: 2px 5px;'><span style='color: #fbbf24; font-weight: bold;'>₹{ce.LTP:.2f}</span> <span style='font-size: 0.75rem; background-color: #fbbf242c; padding: 2px 4px; border-radius: 3px; color: #fbbf24; font-weight: bold;'>ITM</span></div>"
-            else:
-                ce_ltp_html = f"<div style='text-align: center; color: #e2e8f0;'>₹{ce.LTP:.2f}</div>"
-
-            # Render Lot Badges: e.g. B (1x), S (2x) directly over that cell
+            ce_ltp_val = f"₹{ce.LTP:.2f}"
+            ce_badge_html = ""
             if ce_net > 0:
-                ce_lots = int(ce_net // 50) if ce_net >= 50 else 1
-                ce_ltp_html += f"<div style='text-align: center; margin-top: 3px;'><span style='background-color: #22c55e2c; color: #22c55e; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.75rem;'>B ({ce_lots}x)</span></div>"
+                ce_badge_html = f'<br/><span class="badge-act badge-b">B ({int(ce_net // 50)}x)</span>'
             elif ce_net < 0:
-                ce_lots = int(abs(ce_net) // 50) if abs(ce_net) >= 50 else 1
-                ce_ltp_html += f"<div style='text-align: center; margin-top: 3px;'><span style='background-color: #ef44442c; color: #ef4444; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.75rem;'>S ({ce_lots}x)</span></div>"
+                ce_badge_html = f'<br/><span class="badge-act badge-s">S ({int(abs(ce_net) // 50)}x)</span>'
 
-            cols[2].markdown(ce_ltp_html, unsafe_allow_html=True)
-            cols[3].markdown(f"<div style='text-align: center;'>{ce['IV %']:.1f}%</div>", unsafe_allow_html=True)
-            cols[4].markdown(f"<div style='text-align: center;'>{ce.Delta:.2f}</div>", unsafe_allow_html=True)
-            cols[5].markdown(f"<div style='text-align: center;'>{ce.Theta:.1f}</div>", unsafe_allow_html=True)
+            ce_ltp_html = f"""
+            <td class="hover-cell {ce_class}" oncontextmenu="event.preventDefault(); dispatchAction('DESELECT:CALL:{strike}');">
+                <span>{ce_ltp_val}</span>{ce_badge_html}
+                <div class="hover-actions">
+                    <button class="btn-act btn-b" onclick="dispatchAction('BUY:CALL:{strike}')">B</button>
+                    <button class="btn-act btn-s" onclick="dispatchAction('SELL:CALL:{strike}')">S</button>
+                </div>
+            </td>
+            """
         else:
-            for i in range(6): cols[i].write("")
+            ce_ltp_html = f"<td>-</td>"
 
-        # Strike Center styled with clean font color and prominent highlight for high contrast readability
-        if abs(strike - spot) <= step * 0.51:
-            cols[6].markdown(f"<div style='text-align: center; font-weight: bold; background-color: #020617; border: 2.5px solid #22c55e; padding: 2px 5px; border-radius: 4px; color: #38bdf8; font-size: 1.1rem; box-shadow: 0 0 10px #22c55e40;'>{strike:,.0f}</div>", unsafe_allow_html=True)
-        else:
-            cols[6].markdown(f"<div style='text-align: center; font-weight: bold; background-color: #1e293b; border: 1px solid #475569; padding: 2px 5px; border-radius: 4px; color: #38bdf8; font-size: 1.0rem;'>{strike:,.0f}</div>", unsafe_allow_html=True)
-
-        # PE buttons (Acting as dynamic Toggle Switches!)
+        # Build Put LTP Cell
+        pe_ltp_html = ""
         if pe is not None:
-            # BUY PE Toggle Button
-            buy_pe_label = "UNBUY" if pe_b > 0 else "BUY"
-            if cols[11].button(buy_pe_label, key=f"bpe{strike}", use_container_width=True):
-                toggle_chain_trade(strike, "PUT", "BUY", pe.LTP, chain_qty, chain_sl, chain_tp, times, idx)
-                st.rerun()
-
-            # SELL PE Toggle Button
-            sell_pe_label = "UNSELL" if pe_s > 0 else "SELL"
-            if cols[12].button(sell_pe_label, key=f"spe{strike}", use_container_width=True):
-                toggle_chain_trade(strike, "PUT", "SELL", pe.LTP, chain_qty, chain_sl, chain_tp, times, idx)
-                st.rerun()
-
-            # PE LTP cell styling with dynamic In-The-Money highlighting & net quantity display
-            if pe_is_itm:
-                pe_ltp_html = f"<div style='text-align: center; background-color: #c084fc15; border: 1px solid #c084fc40; border-radius: 4px; padding: 2px 5px;'><span style='color: #c084fc; font-weight: bold;'>₹{pe.LTP:.2f}</span> <span style='font-size: 0.75rem; background-color: #c084fc2c; padding: 2px 4px; border-radius: 3px; color: #c084fc; font-weight: bold;'>ITM</span></div>"
-            else:
-                pe_ltp_html = f"<div style='text-align: center; color: #e2e8f0;'>₹{pe.LTP:.2f}</div>"
-
-            # Render Lot Badges: e.g. B (1x), S (2x) directly over that cell
+            pe_ltp_val = f"₹{pe.LTP:.2f}"
+            pe_badge_html = ""
             if pe_net > 0:
-                pe_lots = int(pe_net // 50) if pe_net >= 50 else 1
-                pe_ltp_html += f"<div style='text-align: center; margin-top: 3px;'><span style='background-color: #22c55e2c; color: #22c55e; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.75rem;'>B ({pe_lots}x)</span></div>"
+                pe_badge_html = f'<br/><span class="badge-act badge-b">B ({int(pe_net // 50)}x)</span>'
             elif pe_net < 0:
-                pe_lots = int(abs(pe_net) // 50) if abs(pe_net) >= 50 else 1
-                pe_ltp_html += f"<div style='text-align: center; margin-top: 3px;'><span style='background-color: #ef44442c; color: #ef4444; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.75rem;'>S ({pe_lots}x)</span></div>"
+                pe_badge_html = f'<br/><span class="badge-act badge-s">S ({int(abs(pe_net) // 50)}x)</span>'
 
-            cols[7].markdown(pe_ltp_html, unsafe_allow_html=True)
-            cols[8].markdown(f"<div style='text-align: center;'>{pe['IV %']:.1f}%</div>", unsafe_allow_html=True)
-            cols[9].markdown(f"<div style='text-align: center;'>{pe.Delta:.2f}</div>", unsafe_allow_html=True)
-            cols[10].markdown(f"<div style='text-align: center;'>{pe.Theta:.1f}</div>", unsafe_allow_html=True)
+            pe_ltp_html = f"""
+            <td class="hover-cell {pe_class}" oncontextmenu="event.preventDefault(); dispatchAction('DESELECT:PUT:{strike}');">
+                <span>{pe_ltp_val}</span>{pe_badge_html}
+                <div class="hover-actions">
+                    <button class="btn-act btn-b" onclick="dispatchAction('BUY:PUT:{strike}')">B</button>
+                    <button class="btn-act btn-s" onclick="dispatchAction('SELL:PUT:{strike}')">S</button>
+                </div>
+            </td>
+            """
+        else:
+            pe_ltp_html = f"<td>-</td>"
+
+        # Build Strike cell with double hover triggers (buying CALL on left side, PUT on right side)
+        strike_cell_html = f"""
+        <td class="{strike_class} hover-cell">
+            <span>{strike:,.0f}</span>
+            <div class="hover-actions">
+                <button class="btn-act btn-b" style="background-color: #059669;" onclick="dispatchAction('BUY:CALL:{strike}')">B CE</button>
+                <button class="btn-act btn-b" style="background-color: #7c3aed;" onclick="dispatchAction('BUY:PUT:{strike}')">B PE</button>
+            </div>
+        </td>
+        """
+
+        ce_iv_html = f"<td>{ce['IV %']:.1f}%</td>" if ce is not None else "<td>-</td>"
+        ce_delta_html = f"<td>{ce.Delta:.2f}</td>" if ce is not None else "<td>-</td>"
+
+        pe_iv_html = f"<td>{pe['IV %']:.1f}%</td>" if pe is not None else "<td>-</td>"
+        pe_delta_html = f"<td>{pe.Delta:.2f}</td>" if pe is not None else "<td>-</td>"
+
+        row_html = f"""
+        <tr>
+            {ce_iv_html}
+            {ce_delta_html}
+            {ce_ltp_html}
+            {strike_cell_html}
+            {pe_ltp_html}
+            {pe_delta_html}
+            {pe_iv_html}
+        </tr>
+        """
+        html_elements.append(row_html)
+
+    html_elements.append("""
+        </tbody>
+    </table>
+    """)
+
+    # Render option chain beautifully
+    st.components.v1.html("\n".join(html_elements), height=720, scrolling=True)
 
     # Strategy Builder Section
     st.markdown("---")
     st.subheader("🧩 Multi-Leg Strategy Builder")
     st.caption("Construct multi-leg strategies manually or import popular template strategies. Customize Stop Loss % and Take Profit % per leg and deploy them together.")
 
-    # Find nearest ATM strike
-    unique_strikes = view.Strike.unique() if "Strike" in view.columns else []
-    if len(unique_strikes) > 0:
-        nearest_atm = min(unique_strikes, key=lambda x: abs(x - spot))
-    else:
-        nearest_atm = float(atm)
-
-    # Pre-defined strategy templates
     st.markdown("**Templates:**")
     t1, t2, t3, t4, t5 = st.columns(5)
 
@@ -975,7 +1145,6 @@ with tab_positions:
     if portfolio.empty:
         st.info("No active positions currently. Head to the Option Terminal to place some trades!")
     else:
-        # Prompt selection of "Clear All Positions" to wipe state instantly
         col_clear_1, col_clear_2 = st.columns([1, 4])
         if col_clear_1.button("🚨 Clear All Positions", type="primary", use_container_width=True):
             st.session_state.positions = []
@@ -984,19 +1153,15 @@ with tab_positions:
             st.session_state.mtm_history = []
             st.rerun()
 
-        # Active Position Grid
         for i, row in portfolio.iterrows():
             c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.5, 1, 1, 1, 1.2, 1, 1, 1])
             c1.markdown(f"**{row.Side} {row.Right} {row.Strike:,.0f}**")
 
-            # Dynamic Lot quantity control inline directly inside the Strategy Builder table
             new_qty = c2.number_input("Qty", 25, 100000, int(row.Qty), step=25, key=f"qty_input_{row.id}")
             if new_qty != int(row.Qty):
-                # Update position quantity dynamically
                 p_id = row.id
                 pos_index = next((index for index, item in enumerate(st.session_state.positions) if item.get("id") == p_id), None)
                 if pos_index is not None:
-                    # refund cash difference
                     diff_qty = new_qty - int(row.Qty)
                     if row.Side == "BUY":
                         st.session_state.cash -= diff_qty * row.Avg
@@ -1009,7 +1174,6 @@ with tab_positions:
             c4.write(f"LTP ₹{row.LTP:.2f}")
             c5.metric("P&L", f"₹{row['Unrealized P&L']:,.2f}")
 
-            # SL / TP Dynamic adjustment inputs
             sl_val = float(row["SL %"]) if (row["SL %"] is not None and np.isfinite(row["SL %"])) else 0.0
             tp_val = float(row["TP %"]) if (row["TP %"] is not None and np.isfinite(row["TP %"])) else 0.0
             new_sl = c6.number_input("SL %", 0.0, 100.0, sl_val, step=1.0, key=f"sl_input_{row.id}")
@@ -1099,7 +1263,6 @@ with tab_positions:
                 "qty": int(row.Qty),
                 "premium": float(row.Avg)
             })
-        # Plotly Consolidated Strategy Payoff Curve
         fig = draw_consolidated_payoff_chart(active_legs, spot, step, T, rate, div)
         st.plotly_chart(fig, use_container_width=True)
 
