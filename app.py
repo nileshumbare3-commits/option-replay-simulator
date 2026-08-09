@@ -566,35 +566,49 @@ with st.container(border=True):
                 end_iso = f"{selected_day.strftime('%Y-%m-%d')}T15:30:00.000Z"
                 exp_iso = f"{expiry_date.strftime('%Y-%m-%d')}T07:00:00.000Z"
 
+                from concurrent.futures import ThreadPoolExecutor
                 unauthorized = False
+                tasks = []
                 for k in strikes:
-                    if unauthorized:
-                        break
                     for right in ["call", "put"]:
-                        try:
-                            d0 = get_hist(
-                                client.api_key,
-                                client.secret_key,
-                                session,
-                                symbol,
-                                start_iso,
-                                end_iso,
-                                exp_iso,
-                                right,
-                                k,
-                                interval
-                            )
-                            if not d0.empty:
-                                d0["strike"] = k
-                                d0["right"] = right
-                                frames.append(d0)
-                        except Exception as ex:
-                            if "401" in str(ex) or "Unauthorized" in str(ex) or "unauthorized" in str(ex).lower():
-                                unauthorized = True
-                                st.error("❌ **Breeze Session Unauthorized (401)**: Your session token is invalid or expired. Please click 'Connect/Login ICICI Direct' on the sidebar to get a new session token, or switch 'Data mode' to 'Demo'.")
-                                break
-                            else:
-                                st.warning(f"{right.upper()} {k}: {ex}")
+                        tasks.append((k, right))
+
+                def fetch_contract_data(task):
+                    strike_val, right_val = task
+                    try:
+                        d0 = get_hist(
+                            client.api_key,
+                            client.secret_key,
+                            session,
+                            symbol,
+                            start_iso,
+                            end_iso,
+                            exp_iso,
+                            right_val,
+                            strike_val,
+                            interval
+                        )
+                        if not d0.empty:
+                            d0["strike"] = strike_val
+                            d0["right"] = right_val
+                            return d0
+                    except Exception as ex:
+                        if "401" in str(ex) or "Unauthorized" in str(ex) or "unauthorized" in str(ex).lower():
+                            return "unauthorized"
+                        print(f"Fetch failed for {right_val.upper()} {strike_val}: {ex}")
+                    return None
+
+                with ThreadPoolExecutor(max_workers=20) as executor:
+                    results = list(executor.map(fetch_contract_data, tasks))
+
+                for r_df in results:
+                    if isinstance(r_df, str) and r_df == "unauthorized":
+                        unauthorized = True
+                    elif isinstance(r_df, pd.DataFrame) and not r_df.empty:
+                        frames.append(r_df)
+
+                if unauthorized:
+                    st.error("❌ **Breeze Session Unauthorized (401)**: Your session token is invalid or expired. Please click 'Connect/Login ICICI Direct' on the sidebar to get a new session token, or switch 'Data mode' to 'Demo'.")
 
                 chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
