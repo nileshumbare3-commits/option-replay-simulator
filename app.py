@@ -496,13 +496,57 @@ with st.container(border=True):
 
     expiry_options = get_official_expiry_dates(selected_day, symbol, client)
 
-    default_expiry_index = 0
-    for idx_exp, exp in enumerate(expiry_options):
-        if exp >= selected_day:
-            default_expiry_index = idx_exp
-            break
+    # Define a highly robust, type-safe date formatting helper
+    def safe_format_date(d):
+        if hasattr(d, "strftime"):
+            return d.strftime("%d-%b-%Y")
+        if isinstance(d, str):
+            try:
+                parsed = datetime.strptime(d.split("T")[0], "%Y-%m-%d")
+                return parsed.strftime("%d-%b-%Y")
+            except Exception:
+                return str(d)
+        return str(d)
 
-    expiry_date = m3.selectbox("Option expiry", options=expiry_options, index=default_expiry_index, format_func=lambda d: d.strftime("%d-%b-%Y"))
+    # State preservation logic
+    if "preserved_expiry" not in st.session_state:
+        st.session_state.preserved_expiry = None
+
+    current_day_str = selected_day.strftime("%Y-%m-%d") if hasattr(selected_day, "strftime") else str(selected_day)
+    if (st.session_state.get("last_expiry_selected_day") != current_day_str or
+        st.session_state.get("last_expiry_symbol") != symbol):
+        st.session_state.preserved_expiry = None
+        st.session_state.last_expiry_selected_day = current_day_str
+        st.session_state.last_expiry_symbol = symbol
+
+    expiry_date = selected_day  # safe fallback value
+
+    if not expiry_options:
+        m3.warning("⚠️ No contract expiries found.")
+    else:
+        # Code readability & performance: use next() with fallback
+        default_expiry = None
+        if st.session_state.preserved_expiry in expiry_options:
+            default_expiry = st.session_state.preserved_expiry
+        else:
+            default_expiry = next((exp for exp in expiry_options if exp >= selected_day), None)
+            if default_expiry is None:
+                default_expiry = expiry_options[0]
+
+        default_expiry_index = expiry_options.index(default_expiry) if default_expiry in expiry_options else 0
+
+        selected_exp = m3.selectbox(
+            "Option expiry",
+            options=expiry_options,
+            index=default_expiry_index,
+            format_func=safe_format_date,
+            key="expiry_selectbox_key"
+        )
+
+        if selected_exp:
+            expiry_date = selected_exp
+            st.session_state.preserved_expiry = selected_exp
+
     expiry_time = m4.time_input("Expiry time", time(15, 30))
     rate = m5.number_input("Risk-free %", 6.5, step=.25) / 100
     div = m6.number_input("Dividend %", 0.0, step=.25) / 100
