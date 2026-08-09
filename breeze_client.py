@@ -35,3 +35,31 @@ class BreezeClient:
                        headers={'X-SessionToken':self.session_token,'X-apikey':self.api_key},timeout=30)
         r.raise_for_status()
         return r.json().get('Success',[])
+
+    def get_option_chain_quotes(self, stock_code, strike_price, right="call"):
+        if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
+        import hashlib
+        from datetime import datetime, timezone
+        url = 'https://api.icicidirect.com/breezeapi/api/v1/optionchain'
+        time_stamp = datetime.now(timezone.utc).isoformat()[:19] + '.000Z'
+        payload_dict = {
+            "stock_code": stock_code,
+            "exchange_code": "NFO",
+            "product_type": "options",
+            "right": right.lower(),
+            "strike_price": str(strike_price),
+            "expiry_date": ""
+        }
+        payload = json.dumps(payload_dict, separators=(',', ':'))
+        checksum_input = time_stamp + payload + self.secret_key
+        checksum = hashlib.sha256(checksum_input.encode("utf-8")).hexdigest()
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Checksum': 'token ' + checksum,
+            'X-Timestamp': time_stamp,
+            'X-AppKey': self.api_key,
+            'X-SessionToken': self.session_token
+        }
+        r = requests.get(url, headers=headers, data=payload, timeout=30)
+        r.raise_for_status()
+        return r.json().get('Success', [])
