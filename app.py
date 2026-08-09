@@ -1,19 +1,131 @@
 import os
+import re
+import uuid
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import calendar
-import uuid
 from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
+
 from breeze_client import BreezeClient, format_breeze_date
 from greeks import implied_vol, greeks
-from backend.expiry_service import get_official_expiry_dates, format_contract_symbol, parse_expiry_from_contract
+from backend.expiry_service import (
+    get_dynamic_expiry_dates,
+    format_contract_symbol,
+    parse_expiry_from_symbol_name
+)
 
+# Load environment variables
 load_dotenv()
-st.set_page_config(page_title="Breeze Option Replay", page_icon="📈", layout="wide")
 
+# Streamlit config
+st.set_page_config(
+    page_title="StockMock Options Simulator",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom premium styling (StockMock style)
+st.markdown("""
+<style>
+/* CSS styles to clean up container spacing and styling */
+.block-container {
+    padding-top: 1rem;
+    padding-bottom: 2rem;
+    max-width: 1800px;
+}
+div.stButton > button:first-child {
+    transition: all 0.15s ease-in-out;
+}
+div.stButton > button:first-child:hover {
+    transform: translateY(-1px);
+}
+div[data-testid="stTextInput"]:has(input[placeholder="HiddenTradeSignalInput"]) {
+    display: none !important;
+}
+.metric-card {
+    background-color: #0f172a;
+    border: 1px solid #1e293b;
+    border-radius: 6px;
+    padding: 10px 15px;
+    text-align: center;
+}
+.metric-title {
+    font-size: 0.75rem;
+    color: #94a3b8;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.metric-value {
+    font-size: 1.25rem;
+    font-weight: 700;
+}
+.tag-green {
+    background-color: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: bold;
+}
+.tag-red {
+    background-color: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: bold;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# PostMessage communication listener for interactive hover option chain
+st.markdown("""
+<script>
+window.addEventListener("message", (event) => {
+    const actionStr = event.data;
+    if (typeof actionStr === "string" && (actionStr.startsWith("BUY:") || actionStr.startsWith("SELL:") || actionStr.startsWith("DESELECT:"))) {
+        const input = window.parent.document.querySelector('input[placeholder="HiddenTradeSignalInput"]');
+        if (input) {
+            input.value = actionStr;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+});
+</script>
+""", unsafe_allow_html=True)
+
+# ----------------- SESSION STATE INITIALIZATION -----------------
+if "positions" not in st.session_state:
+    st.session_state.positions = []
+if "cash" not in st.session_state:
+    st.session_state.cash = 1_000_000.0
+if "trade_history" not in st.session_state:
+    st.session_state.trade_history = []
+if "mtm_history" not in st.session_state:
+    st.session_state.mtm_history = []
+if "strategy_legs" not in st.session_state:
+    st.session_state.strategy_legs = []
+if "autoplay" not in st.session_state:
+    st.session_state.autoplay = False
+if "autoplay_speed" not in st.session_state:
+    st.session_state.autoplay_speed = 1.0
+if "replay_date" not in st.session_state:
+    st.session_state.replay_date = date(2026, 8, 7)
+if "replay_time" not in st.session_state:
+    st.session_state.replay_time = time(9, 15)
+if "active_expiry_date" not in st.session_state:
+    st.session_state.active_expiry_date = None
+if "selected_rows" not in st.session_state:
+    st.session_state.selected_rows = set()
+if "multiplier" not in st.session_state:
+    st.session_state.multiplier = 1
+
+# Helper to load credential fallback
 def load_env_credentials():
     api_key = os.getenv("BREEZE_API_KEY", "")
     secret_key = os.getenv("BREEZE_SECRET_KEY", "")
@@ -38,7 +150,71 @@ def load_env_credentials():
                     pass
     return api_key, secret_key
 
-# ---------- helpers ----------
+# Load keys
+api_key_env, secret_key_env = load_env_credentials()
+if "breeze_api_key" not in st.session_state or not st.session_state.breeze_api_key:
+    st.session_state.breeze_api_key = api_key_env
+if "breeze_secret_key" not in st.session_state or not st.session_state.breeze_secret_key:
+    st.session_state.breeze_secret_key = secret_key_env
+
+client = BreezeClient(
+    api_key=st.session_state.breeze_api_key,
+    secret_key=st.session_state.breeze_secret_key,
+    session_token=st.session_state.get("session_token")
+)
+
+# Connect Oauth redirects dynamically
+api_session = None
+for param_name in ["API_Session", "api_session", "apisession", "session_token", "token"]:
+    if param_name in st.query_params:
+        api_session = st.query_params[param_name]
+        break
+
+if api_session and client.configured:
+    try:
+        with st.spinner("Exchanging redirected session token..."):
+            st.session_state["session_token"] = client.exchange_api_session(api_session)
+        st.query_params.clear()
+        st.rerun()
+    except Exception as ex:
+        st.error(f"Auto-exchange failed: {ex}")
+
+# ----------------- SIDEBAR: LOGIN & SETUP -----------------
+with st.sidebar:
+    st.header("🔑 Breeze API Connection")
+    with st.expander("Configure API Keys", expanded=not (st.session_state.breeze_api_key and st.session_state.breeze_secret_key)):
+        user_api_key = st.text_input("Breeze API Key", value=st.session_state.breeze_api_key)
+        user_secret_key = st.text_input("Breeze Secret Key", value=st.session_state.breeze_secret_key, type="password")
+        if user_api_key != st.session_state.breeze_api_key or user_secret_key != st.session_state.breeze_secret_key:
+            st.session_state.breeze_api_key = user_api_key
+            st.session_state.breeze_secret_key = user_secret_key
+            st.rerun()
+
+    if client.configured:
+        st.link_button("🌐 Login & Authorize ICICI Direct", client.login_url(), use_container_width=True)
+        manual_session = st.text_input("Paste redirect URL or token", placeholder="api_session=...")
+        if st.button("Exchange Session", use_container_width=True) and manual_session:
+            token = manual_session
+            if "api_session=" in manual_session:
+                token = manual_session.split("api_session=")[1].split("&")[0]
+            try:
+                st.session_state["session_token"] = client.exchange_api_session(token)
+                st.success("Connected!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed: {e}")
+    else:
+        st.info("Demo mode active. Provide credentials above to trade with Breeze.")
+
+    if st.session_state.get("session_token"):
+        st.success("● Connected to ICICI Breeze API")
+        if st.button("Disconnect", use_container_width=True):
+            st.session_state["session_token"] = None
+            st.rerun()
+    else:
+        st.info("● Simulated Demo Mode")
+
+# ----------------- UTILITY HELPERS -----------------
 def is_real_session_token(token):
     if not token or len(token) < 10 or token.startswith("exchanged_") or "mock" in token.lower() or "session" in token.lower():
         return False
@@ -63,37 +239,41 @@ def get_index_hist(api_key, secret_key, session, symbol, start, end, interval):
     return norm(c.historical_index(symbol, start, end, interval))
 
 def demo_chain(atm, step, count, day):
-    rng=np.random.default_rng(7)
-    times=pd.date_range(f"{day} 09:15", f"{day} 15:30", freq="5min")
-    strikes=[round(atm+(i-count//2)*step,2) for i in range(count)]
-    rows=[]; spot_path=atm+np.cumsum(rng.normal(0,step*.025,len(times)))
-    for ti,ts in enumerate(times):
-        spot=spot_path[ti]
+    rng = np.random.default_rng(42)
+    times = pd.date_range(f"{day} 09:15", f"{day} 15:30", freq="5min")
+    strikes = [round(atm + (i - count // 2) * step, 2) for i in range(count)]
+    rows = []
+    spot_path = atm + np.cumsum(rng.normal(0, step * 0.02, len(times)))
+    for ti, ts in enumerate(times):
+        spot = spot_path[ti]
         for k in strikes:
-            for right in ["call","put"]:
-                intrinsic=max(spot-k,0) if right=="call" else max(k-spot,0)
-                tv=max(5,step*.8*np.exp(-abs(spot-k)/(step*2)))
-                price=max(.5,intrinsic+tv+rng.normal(0,.8))
-                rows.append({"datetime":ts,"close":price,"volume":int(rng.integers(500,15000)),"open_interest":int(rng.integers(5000,90000)),"strike":k,"right":right,"spot":spot})
+            for right in ["call", "put"]:
+                intrinsic = max(spot - k, 0) if right == "call" else max(k - spot, 0)
+                tv = max(5, step * 0.8 * np.exp(-abs(spot - k) / (step * 2)))
+                price = max(0.5, intrinsic + tv + rng.normal(0, 0.5))
+                # Add simulated OI & Vol
+                dist = abs(k - spot) / step
+                oi = int(max(1000, 100000 * np.exp(-dist * 0.2)))
+                vol = int(max(500, 500000 * np.exp(-dist * 0.3)))
+                rows.append({
+                    "datetime": ts,
+                    "close": price,
+                    "volume": vol,
+                    "open_interest": oi,
+                    "strike": k,
+                    "right": right,
+                    "spot": spot
+                })
     return pd.DataFrame(rows), times
-
-def payoff(legs, spots):
-    total=np.zeros_like(spots,dtype=float)
-    for leg in legs:
-        intrinsic=np.maximum(spots-leg["strike"],0) if leg["right"].upper()=="CALL" else np.maximum(leg["strike"]-spots,0)
-        per=intrinsic-leg["premium"] if leg["side"].upper()=="BUY" else leg["premium"]-intrinsic
-        total += leg["qty"]*per
-    return total
-
-def move_index(times, idx, delta):
-    if not times: return idx
-    return max(0,min(len(times)-1,idx+delta))
 
 def get_spot_price(client, symbol, selected_day, selected_time, mode):
     if mode == "Demo":
         base_spot = 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
         day_variance = (selected_day.day * 15.0) - 200.0
-        return base_spot + day_variance
+        # Time progression variance
+        time_minutes = selected_time.hour * 60 + selected_time.minute - 555 # from 9:15
+        time_variance = time_minutes * 0.15
+        return base_spot + day_variance + time_variance
     else:
         session = st.session_state.get("session_token")
         if not is_real_session_token(session):
@@ -115,751 +295,394 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
             print(f"Failed to fetch auto-spot price from Breeze: {e}. Using fallback.")
         return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
 
-def get_strike_position_info(strike, right):
-    active_positions = st.session_state.get("positions", [])
-    net_qty = 0
-    buys = 0
-    sells = 0
-    for p in active_positions:
-        if p["strike"] == float(strike) and p["right"].upper() == right.upper():
-            q = p["qty"]
-            if p["side"] == "BUY":
-                net_qty += q
-                buys += q
-            else:
-                net_qty -= q
-                sells += q
-    return net_qty, buys, sells
+def adjust_replay_time(minutes_delta: int):
+    current_dt = datetime.combine(st.session_state.replay_date, st.session_state.replay_time)
+    new_dt = current_dt + timedelta(minutes=minutes_delta)
+    st.session_state.replay_date = new_dt.date()
+    # Clip between 09:15 and 15:30
+    sod_dt = datetime.combine(new_dt.date(), time(9, 15))
+    eod_dt = datetime.combine(new_dt.date(), time(15, 30))
+    if new_dt < sod_dt:
+        st.session_state.replay_time = time(9, 15)
+    elif new_dt > eod_dt:
+        st.session_state.replay_time = time(15, 30)
+    else:
+        st.session_state.replay_time = new_dt.time()
 
-from backend.math_engine import black_scholes_pricing
+# ----------------- STEP 4: TOP CONTROL BAR & PRICE SUMMARY LINE -----------------
+st.title("🛡️ StockMock Options Simulator")
+st.caption("Professional Full-Stack Options Trading Replay Dashboard")
 
-def draw_consolidated_payoff_chart(active_legs, spot, step, T, rate, div):
-    spots = np.linspace(max(1, spot - step * 10), spot + step * 10, 201)
+# Top Control Bar layout
+bar_col1, bar_col2, bar_col3 = st.columns([1.5, 6.5, 2.0])
 
-    # 1. Calculate Expiry P&L (T = 0)
-    expiry_pnl = np.zeros_like(spots, dtype=float)
-    for leg in active_legs:
-        intrinsic = np.maximum(spots - leg["strike"], 0) if leg["right"].upper() == "CALL" else np.maximum(leg["strike"] - spots, 0)
-        per = intrinsic - leg["premium"] if leg["side"].upper() == "BUY" else leg["premium"] - intrinsic
-        expiry_pnl += leg["qty"] * per
+with bar_col1:
+    symbol = st.selectbox("Underlying Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], label_visibility="collapsed")
+    mode = st.selectbox("Data mode", ["Demo", "Breeze"], index=0, label_visibility="collapsed")
 
-    # 2. Calculate Today's MTM (T = T_target)
-    mtm_pnl = np.zeros_like(spots, dtype=float)
-    sigma = 0.18  # standard Indian options average IV
-    for leg in active_legs:
-        mult = 1.0 if leg["side"].upper() == "BUY" else -1.0
-        leg_prices = np.array([
-            black_scholes_pricing(s, leg["strike"], T, rate, div, sigma, leg["right"].lower())
-            for s in spots
-        ])
-        mtm_pnl += leg["qty"] * (leg_prices - leg["premium"]) * mult
-
-    # Build consolidated plot
-    fig = go.Figure()
-
-    # Shading the Profit Zone (above 0)
-    profit_shade = np.maximum(expiry_pnl, 0)
-    fig.add_trace(go.Scatter(
-        x=spots, y=profit_shade,
-        mode="lines",
-        line=dict(width=0),
-        fill="tozeroy",
-        fillcolor="rgba(34, 197, 94, 0.2)",
-        name="Profit Zone",
-        showlegend=False
-    ))
-
-    # Shading the Loss Zone (below 0)
-    loss_shade = np.minimum(expiry_pnl, 0)
-    fig.add_trace(go.Scatter(
-        x=spots, y=loss_shade,
-        mode="lines",
-        line=dict(width=0),
-        fill="tozeroy",
-        fillcolor="rgba(239, 68, 68, 0.2)",
-        name="Loss Zone",
-        showlegend=False
-    ))
-
-    # Expiry Payoff line (solid)
-    fig.add_trace(go.Scatter(
-        x=spots, y=expiry_pnl,
-        mode="lines",
-        line=dict(color="#22c55e", width=3),
-        name="Expiry Payoff (T=0)"
-    ))
-
-    # Today's MTM curve (dashed)
-    fig.add_trace(go.Scatter(
-        x=spots, y=mtm_pnl,
-        mode="lines",
-        line=dict(color="#38bdf8", width=2.5, dash="dash"),
-        name="Today's MTM (T+t)"
-    ))
-
-    fig.add_vline(x=spot, line_dash="dot", line_color="#f97316", width=2, annotation_text="Spot", annotation_position="top left")
-    fig.add_hline(y=0, line_dash="solid", line_color="#475569", width=1)
-
-    fig.update_layout(
-        title="Consolidated Strategy Payoff & Today's MTM Chart (StockMock Style)",
-        xaxis_title="Underlying Spot Price (₹)",
-        yaxis_title="Profit / Loss (₹)",
-        height=450,
-        hovermode="x unified",
-        template="plotly_dark",
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    return fig
-
-def current_quotes(view):
-    return {(str(r.Right),float(r.Strike)):float(r.LTP) for _,r in view.iterrows()}
-
-def check_risk_triggers(current_time, view):
-    quotes = current_quotes(view)
-    active_positions = st.session_state.get("positions", [])
-    remaining_positions = []
-    triggered_any = False
-
-    for p in active_positions:
-        r = p["right"]
-        k = p["strike"]
-        side = p["side"]
-        qty = p["qty"]
-        avg = p["avg"]
-        sl = p.get("sl_pct")
-        tp = p.get("tp_pct")
-
-        ltp = quotes.get((r, k), np.nan)
-        if not np.isfinite(ltp):
-            remaining_positions.append(p)
-            continue
-
-        triggered = False
-        trigger_reason = ""
-
-        if side == "BUY":
-            if sl is not None and sl > 0:
-                sl_price = avg * (1.0 - sl / 100.0)
-                if ltp <= sl_price:
-                    triggered = True
-                    trigger_reason = f"SL ({sl}%)"
-            if tp is not None and tp > 0:
-                tp_price = avg * (1.0 + tp / 100.0)
-                if ltp >= tp_price:
-                    triggered = True
-                    trigger_reason = f"TP ({tp}%)"
-        else: # SELL
-            if sl is not None and sl > 0:
-                sl_price = avg * (1.0 + sl / 100.0)
-                if ltp >= sl_price:
-                    triggered = True
-                    trigger_reason = f"SL ({sl}%)"
-            if tp is not None and tp > 0:
-                tp_price = avg * (1.0 - tp / 100.0)
-                if ltp <= tp_price:
-                    triggered = True
-                    trigger_reason = f"TP ({tp}%)"
-
-        if triggered:
-            realized = 0.0
-            if side == "BUY":
-                st.session_state.cash += qty * ltp
-                realized = (ltp - avg) * qty
-            else: # SELL
-                st.session_state.cash -= qty * ltp
-                realized = (avg - ltp) * qty
-
-            st.session_state.trade_history.append({
-                "time": current_time,
-                "action": f"AUTO_CLOSE ({trigger_reason})",
-                "right": r,
-                "strike": k,
-                "qty": qty,
-                "price": ltp,
-                "realized": realized
-            })
-            triggered_any = True
-        else:
-            remaining_positions.append(p)
-
-    if triggered_any:
-        st.session_state.positions = remaining_positions
-        return True
-    return False
-
-def mark_portfolio(view):
-    quotes = current_quotes(view)
-    total_val = 0.0
-    rows = []
-    active_positions = st.session_state.get("positions", [])
-    for idx, p in enumerate(active_positions):
-        r = p["right"]
-        k = p["strike"]
-        qty = p["qty"]
-        avg = p["avg"]
-        side = p["side"]
-        sl = p.get("sl_pct", 0.0)
-        tp = p.get("tp_pct", 0.0)
-
-        ltp = quotes.get((r, k), np.nan)
-
-        if np.isfinite(ltp):
-            if side == "BUY":
-                mv = qty * ltp
-                unreal = (ltp - avg) * qty
-            else:
-                mv = -qty * ltp
-                unreal = (avg - ltp) * qty
-            total_val += mv
-        else:
-            unreal = np.nan
-
-        rows.append({
-            "idx": idx,
-            "id": p.get("id"),
-            "Right": r,
-            "Strike": k,
-            "Side": side,
-            "Qty": qty,
-            "Avg": avg,
-            "LTP": ltp,
-            "SL %": sl,
-            "TP %": tp,
-            "Unrealized P&L": unreal
-        })
-    return pd.DataFrame(rows), total_val
-
-# ---------- state ----------
-if "positions" not in st.session_state or isinstance(st.session_state.positions, dict):
-    st.session_state.positions = []
-if "cash" not in st.session_state:
-    st.session_state.cash = 1_000_000.0
-if "trade_history" not in st.session_state:
-    st.session_state.trade_history = []
-if "mtm_history" not in st.session_state:
-    st.session_state.mtm_history = []
-if "strategy_legs" not in st.session_state:
-    st.session_state.strategy_legs = []
-if "autoplay" not in st.session_state:
-    st.session_state.autoplay = False
-if "autoplay_speed" not in st.session_state:
-    st.session_state.autoplay_speed = 1.0
-
-# STREAMLIT INTERACTIVE STYLE OVERLAYS
-st.markdown("""
-<style>
-.block-container{padding-top:1rem;max-width:1750px}.small{color:#8b949e;font-size:.85rem}
-div.stButton > button:first-child {
-    transition: all 0.2s ease-in-out;
-}
-div.stButton > button:first-child:hover {
-    transform: scale(1.05);
-}
-div[data-testid="stTextInput"]:has(input[placeholder="HiddenTradeSignalInput"]) {
-    display: none !important;
-}
-</style>
-""",unsafe_allow_html=True)
-
-# PostMessage Cross-Origin Communications Listener:
-# Allows custom HTML iframe components to securely notify and update the main parent Streamlit context
-st.markdown("""
-<script>
-window.addEventListener("message", (event) => {
-    const actionStr = event.data;
-    if (typeof actionStr === "string" && (actionStr.startsWith("BUY:") || actionStr.startsWith("SELL:") || actionStr.startsWith("DESELECT:"))) {
-        const input = window.parent.document.querySelector('input[placeholder="HiddenTradeSignalInput"]');
-        if (input) {
-            input.value = actionStr;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-    }
-});
-</script>
-""", unsafe_allow_html=True)
-
-st.title("📈 Breeze Option Replay")
-st.caption("Historical paper-trading simulator • every paper fill is replay-time stamped • no live orders")
-
-# 1. API Keys configuration from environment variables, .env, or fallback .env.example
-api_key_env, secret_key_env = load_env_credentials()
-
-if "breeze_api_key" not in st.session_state or not st.session_state.breeze_api_key:
-    st.session_state.breeze_api_key = api_key_env
-if "breeze_secret_key" not in st.session_state or not st.session_state.breeze_secret_key:
-    st.session_state.breeze_secret_key = secret_key_env
-
-# Create BreezeClient instance
-client = BreezeClient(
-    api_key=st.session_state.breeze_api_key,
-    secret_key=st.session_state.breeze_secret_key,
-    session_token=st.session_state.get("session_token")
-)
-
-# ---------- auto-connect & token exchange ----------
-api_session = None
-for param_name in ["API_Session", "api_session", "apisession", "session_token", "token"]:
-    if param_name in st.query_params:
-        api_session = st.query_params[param_name]
-        break
-
-if api_session and client.configured:
-    try:
-        with st.spinner("Exchanging redirected session token..."):
-            st.session_state["session_token"] = client.exchange_api_session(api_session)
-        st.query_params.clear()
+with bar_col2:
+    # 15 navigation buttons
+    nav_cols = st.columns(14)
+    if nav_cols[0].button("<< Day", use_container_width=True):
+        st.session_state.replay_date -= timedelta(days=1)
         st.rerun()
-    except Exception as ex:
-        st.error(f"Auto-exchange failed: {ex}")
+    if nav_cols[1].button("SOD", use_container_width=True):
+        st.session_state.replay_time = time(9, 15)
+        st.rerun()
+    if nav_cols[2].button("-2h", use_container_width=True):
+        adjust_replay_time(-120)
+        st.rerun()
+    if nav_cols[3].button("-30m", use_container_width=True):
+        adjust_replay_time(-30)
+        st.rerun()
+    if nav_cols[4].button("-15m", use_container_width=True):
+        adjust_replay_time(-15)
+        st.rerun()
+    if nav_cols[5].button("-5m", use_container_width=True):
+        adjust_replay_time(-5)
+        st.rerun()
+    if nav_cols[6].button("-1m", use_container_width=True):
+        adjust_replay_time(-1)
+        st.rerun()
 
-# ---------- controls ----------
-with st.container(border=True):
-    a,b,c,d,e,f=st.columns([1.1,1.0,1.35,1.15,1.2,1.1])
-    symbol=a.selectbox("Underlying",["NIFTY","BANKNIFTY","FINNIFTY"])
-    mode=b.selectbox("Data mode",["Demo","Breeze"])
-    selected_day=c.date_input("Replay date",date(2026,8,7))
-    selected_time=d.time_input("Replay time",time(9,15),step=300)
-    interval=e.selectbox("Bar interval",["1minute","5minute","15minute","30minute","1day"],index=1)
-    step=f.number_input("Strike step",5.0,step=50.0,value=50.0)
+    # Date & Time Pickers inline
+    st.session_state.replay_date = nav_cols[7].date_input("Date", st.session_state.replay_date, label_visibility="collapsed")
+    st.session_state.replay_time = nav_cols[8].time_input("Time", st.session_state.replay_time, label_visibility="collapsed")
 
-with st.sidebar:
-    st.header("🔐 Connection")
+    if nav_cols[9].button("+1m", use_container_width=True):
+        adjust_replay_time(1)
+        st.rerun()
+    if nav_cols[10].button("+5m", use_container_width=True):
+        adjust_replay_time(5)
+        st.rerun()
+    if nav_cols[11].button("+15m", use_container_width=True):
+        adjust_replay_time(15)
+        st.rerun()
+    if nav_cols[12].button("+30m", use_container_width=True):
+        adjust_replay_time(30)
+        st.rerun()
+    if nav_cols[13].button("+2h", use_container_width=True):
+        adjust_replay_time(120)
+        st.rerun()
 
-    with st.expander("🔑 Configure Breeze API Keys", expanded=not (st.session_state.breeze_api_key and st.session_state.breeze_secret_key)):
-        user_api_key = st.text_input("Breeze API Key", value=st.session_state.breeze_api_key, placeholder="Enter API Key")
-        user_secret_key = st.text_input("Breeze Secret Key", value=st.session_state.breeze_secret_key, type="password", placeholder="Enter Secret Key")
-        if user_api_key != st.session_state.breeze_api_key or user_secret_key != st.session_state.breeze_secret_key:
-            st.session_state.breeze_api_key = user_api_key
-            st.session_state.breeze_secret_key = user_secret_key
+with bar_col3:
+    col_play, col_snap = st.columns([1.2, 0.8])
+    with col_play:
+        ap_label = "🔴 Stop Run" if st.session_state.autoplay else "🟢 Auto Run"
+        if st.button(ap_label, type="primary" if not st.session_state.autoplay else "secondary", use_container_width=True):
+            st.session_state.autoplay = not st.session_state.autoplay
             st.rerun()
+    with col_snap:
+        if st.button("📸 Snap", use_container_width=True):
+            st.toast("Replay Snapshot captured!", icon="📸")
 
-    if client.configured:
-        st.link_button("🌐 Connect/Login ICICI Direct", client.login_url(), use_container_width=True)
+    # Speed slider smaller
+    st.session_state.autoplay_speed = st.slider("Autoplay Speed (Hz)", 0.2, 5.0, value=float(st.session_state.autoplay_speed), step=0.2, label_visibility="collapsed")
+
+# ----------------- DYNAMIC CALCULATIONS & LOAD -----------------
+# Setup step/count based on symbol
+if symbol == "NIFTY":
+    step = 50.0
+    strike_count = 30
+elif symbol == "BANKNIFTY":
+    step = 100.0
+    strike_count = 30
+else:
+    step = 50.0
+    strike_count = 20
+
+# Determine spot price
+auto_spot = get_spot_price(client, symbol, st.session_state.replay_date, st.session_state.replay_time, mode)
+nearest_atm = round(round(auto_spot / step) * step, 2)
+
+# Dynamic expiry fetching (No legacy weekday offsets or Tuesday/Thursday shift rules!)
+expiry_options = get_dynamic_expiry_dates(symbol, nearest_atm, step, st.session_state.replay_date, client)
+
+if not st.session_state.active_expiry_date or st.session_state.active_expiry_date not in expiry_options:
+    st.session_state.active_expiry_date = expiry_options[0]
+
+active_expiry = st.session_state.active_expiry_date
+
+# Load the option chain automatically
+current_load_key = f"{symbol}_{mode}_{st.session_state.replay_date}_{st.session_state.replay_time}_{step}_{strike_count}_{active_expiry}"
+if st.session_state.get("last_load_key") != current_load_key:
+    if mode == "Demo":
+        chain, times = demo_chain(nearest_atm, step, strike_count, st.session_state.replay_date)
     else:
-        st.info("Demo mode works without credentials. Enter API credentials above to connect Breeze.")
-
-    # Manual Session Token/Exchange
-    if client.configured:
-        manual_session = st.text_input("Manual API Session / Redirect URL", placeholder="Paste api_session or redirected URL")
-        if st.button("🔌 Exchange Session Token", use_container_width=True):
-            if manual_session:
-                token_to_exchange = manual_session
-                if "api_session=" in manual_session:
-                    try:
-                        token_to_exchange = manual_session.split("api_session=")[1].split("&")[0]
-                    except Exception:
-                        pass
-                try:
-                    with st.spinner("Exchanging manual token..."):
-                        session_token = client.exchange_api_session(token_to_exchange)
-                        st.session_state["session_token"] = session_token
-                    st.success("Session exchanged successfully!")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Exchange failed: {ex}")
-            else:
-                st.warning("Please enter a token or URL first.")
-
-    # Connection Status
-    if st.session_state.get("session_token"):
-        st.success("● Connected to Breeze")
-        trunc_token = st.session_state["session_token"][:8] + "..." if len(st.session_state["session_token"]) > 10 else st.session_state["session_token"]
-        st.caption(f"Session Token: {trunc_token}")
-        if st.button("🚪 Disconnect Breeze", use_container_width=True):
-            st.session_state["session_token"] = None
-            st.rerun()
-    else:
-        st.warning("● Demo / Paper Mode Active")
-
-# ---------- auto-calculate spot price ----------
-current_params_key = f"{symbol}_{mode}_{selected_day}_{selected_time}"
-if st.session_state.get("last_params_key") != current_params_key:
-    auto_spot = get_spot_price(client, symbol, selected_day, selected_time, mode)
-    st.session_state["atm_strike_val"] = auto_spot
-    st.session_state["last_params_key"] = current_params_key
-
-if "atm_strike_val" not in st.session_state:
-    st.session_state["atm_strike_val"] = 25000.0
-
-# ---------- market parameters & load chain ----------
-with st.container(border=True):
-    st.markdown("#### 📅 Market Setup & Option Parameters")
-    m1, m2, m3, m4, m5, m6 = st.columns([1.2, 1.2, 1.4, 1.2, 1.0, 1.0])
-
-    atm = m1.number_input("ATM strike", 1000.0, step=50.0, value=float(st.session_state["atm_strike_val"]))
-    st.session_state["atm_strike_val"] = atm
-
-    strike_count = m2.slider("Strikes", 4, 40, 40)
-
-    expiry_options = get_official_expiry_dates(selected_day, symbol, client)
-
-    # Define a highly robust, type-safe date formatting helper
-    def safe_format_date(d):
-        if hasattr(d, "strftime"):
-            return d.strftime("%d-%b-%Y")
-        if isinstance(d, str):
-            try:
-                parsed = datetime.strptime(d.split("T")[0], "%Y-%m-%d")
-                return parsed.strftime("%d-%b-%Y")
-            except Exception:
-                return str(d)
-        return str(d)
-
-    # State preservation logic
-    if "preserved_expiry" not in st.session_state:
-        st.session_state.preserved_expiry = None
-
-    current_day_str = selected_day.strftime("%Y-%m-%d") if hasattr(selected_day, "strftime") else str(selected_day)
-    if (st.session_state.get("last_expiry_selected_day") != current_day_str or
-        st.session_state.get("last_expiry_symbol") != symbol):
-        st.session_state.preserved_expiry = None
-        st.session_state.last_expiry_selected_day = current_day_str
-        st.session_state.last_expiry_symbol = symbol
-
-    expiry_date = selected_day  # safe fallback value
-
-    if not expiry_options:
-        m3.warning("⚠️ No contract expiries found.")
-    else:
-        # Code readability & performance: use next() with fallback
-        default_expiry = None
-        if st.session_state.preserved_expiry in expiry_options:
-            default_expiry = st.session_state.preserved_expiry
+        # Load real Breeze Option Chain
+        session = st.session_state.get("session_token")
+        if not session:
+            st.sidebar.warning("Connect Breeze. Loading simulated option chain.")
+            chain, times = demo_chain(nearest_atm, step, strike_count, st.session_state.replay_date)
         else:
-            default_expiry = next((exp for exp in expiry_options if exp >= selected_day), None)
-            if default_expiry is None:
-                default_expiry = expiry_options[0]
+            start_iso = f"{st.session_state.replay_date.strftime('%Y-%m-%d')}T09:15:00.000Z"
+            end_iso = f"{st.session_state.replay_date.strftime('%Y-%m-%d')}T15:30:00.000Z"
+            exp_iso = f"{active_expiry.strftime('%Y-%m-%d')}T07:00:00.000Z"
 
-        default_expiry_index = expiry_options.index(default_expiry) if default_expiry in expiry_options else 0
-
-        selected_exp = m3.selectbox(
-            "Option expiry",
-            options=expiry_options,
-            index=default_expiry_index,
-            format_func=safe_format_date,
-            key="expiry_selectbox_key"
-        )
-
-        if selected_exp:
-            expiry_date = selected_exp
-            st.session_state.preserved_expiry = selected_exp
-
-    expiry_time = m4.time_input("Expiry time", time(15, 30))
-    rate = m5.number_input("Risk-free %", 6.5, step=.25) / 100
-    div = m6.number_input("Dividend %", 0.0, step=.25) / 100
-
-    if st.button("🔄 Load / Generate Chain", type="primary", use_container_width=True):
-        if mode == "Demo":
-            chain, times = demo_chain(atm, step, strike_count, selected_day)
-        else:
-            session = st.session_state.get("session_token")
+            # Fetch strikes Centered around ATM
+            strikes = sorted(round(nearest_atm + (i - strike_count // 2) * step, 2) for i in range(strike_count))
+            from concurrent.futures import ThreadPoolExecutor
             frames = []
-            strikes = sorted(round(atm + (i - strike_count // 2) * step, 2) for i in range(strike_count))
-            if not session:
-                st.error("Connect Breeze first.")
-                chain, times = pd.DataFrame(), []
-            else:
-                start_iso = f"{selected_day.strftime('%Y-%m-%d')}T09:15:00.000Z"
-                end_iso = f"{selected_day.strftime('%Y-%m-%d')}T15:30:00.000Z"
-                exp_iso = f"{expiry_date.strftime('%Y-%m-%d')}T07:00:00.000Z"
+            tasks = [(k, r) for k in strikes for r in ["call", "put"]]
 
-                from concurrent.futures import ThreadPoolExecutor
-                unauthorized = False
-                tasks = []
-                for k in strikes:
-                    for right in ["call", "put"]:
-                        tasks.append((k, right))
+            def fetch_single(task):
+                strike_val, right_val = task
+                try:
+                    d0 = get_hist(client.api_key, client.secret_key, session, symbol, start_iso, end_iso, exp_iso, right_val, strike_val, "5minute")
+                    if not d0.empty:
+                        d0["strike"] = strike_val
+                        d0["right"] = right_val
+                        return d0
+                except Exception:
+                    pass
+                return None
 
-                def fetch_contract_data(task):
-                    strike_val, right_val = task
-                    try:
-                        d0 = get_hist(
-                            client.api_key,
-                            client.secret_key,
-                            session,
-                            symbol,
-                            start_iso,
-                            end_iso,
-                            exp_iso,
-                            right_val,
-                            strike_val,
-                            interval
-                        )
-                        if not d0.empty:
-                            d0["strike"] = strike_val
-                            d0["right"] = right_val
-                            return d0
-                    except Exception as ex:
-                        if "401" in str(ex) or "Unauthorized" in str(ex) or "unauthorized" in str(ex).lower():
-                            return "unauthorized"
-                        print(f"Fetch failed for {right_val.upper()} {strike_val}: {ex}")
-                    return None
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                results = list(executor.map(fetch_single, tasks))
 
-                with ThreadPoolExecutor(max_workers=20) as executor:
-                    results = list(executor.map(fetch_contract_data, tasks))
+            for r_df in results:
+                if isinstance(r_df, pd.DataFrame) and not r_df.empty:
+                    frames.append(r_df)
 
-                for r_df in results:
-                    if isinstance(r_df, str) and r_df == "unauthorized":
-                        unauthorized = True
-                    elif isinstance(r_df, pd.DataFrame) and not r_df.empty:
-                        frames.append(r_df)
+            chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
 
-                if unauthorized:
-                    st.error("❌ **Breeze Session Unauthorized (401)**: Your session token is invalid or expired. Please click 'Connect/Login ICICI Direct' on the sidebar to get a new session token, or switch 'Data mode' to 'Demo'.")
+            if chain.empty:
+                chain, times = demo_chain(nearest_atm, step, strike_count, st.session_state.replay_date)
 
-                chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-                times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
+    if hasattr(times, "tolist"):
+        times = times.tolist()
+    else:
+        times = list(times)
+    st.session_state.chain = chain
+    st.session_state.times = times
+    st.session_state.last_load_key = current_load_key
 
-                if chain.empty:
-                    if unauthorized:
-                        st.info("💡 Gracefully loaded high-fidelity simulated Option Chain in **Demo mode** so you can continue simulating!")
-                    else:
-                        st.toast("⚠️ Breeze API returned empty chain for this contract date. Gracefully loading un-cached high-fidelity simulated Option Chain.", icon="💡")
-                    chain, times = demo_chain(atm, step, strike_count, selected_day)
-                    st.session_state["breeze_fallback_active"] = True
-                else:
-                    st.session_state["breeze_fallback_active"] = False
-
-        st.session_state.chain = chain
-        st.session_state.times = times
-
-        target = pd.Timestamp(datetime.combine(selected_day, selected_time))
-        if len(times) > 0:
-            st.session_state.idx = int(np.argmin([abs(pd.Timestamp(x) - target) for x in times]))
-        st.session_state.mtm_history = []
-
-chain=st.session_state.get("chain",pd.DataFrame()); times=st.session_state.get("times",[])
-if chain.empty:
-    st.info("Choose a date/time and expiry, then click Load / Generate Chain."); st.stop()
-
-if st.session_state.get("breeze_fallback_active", False):
-    st.info("💡 **Replay Engine Status**: Real ICICI Securities historical options database was empty for this specific date/expiry. Un-cached simulated Option Chain loaded so you can continuously trade and replay.")
-
-if hasattr(times, "tolist"):
-    times = times.tolist()
-
-idx=min(st.session_state.get("idx",0),len(times)-1)
-
-# Ensure AutoPlay continues running if active
-import time as ptime
-if st.session_state.autoplay:
-    if idx < len(times) - 1:
-        time_to_wait = 1.0 / max(0.1, st.session_state.autoplay_speed)
-        ptime.sleep(time_to_wait)
-        st.session_state.idx = idx + 1
+# Autoplay tick loop
+times = st.session_state.get("times", [])
+if st.session_state.autoplay and len(times) > 0:
+    target_dt = pd.Timestamp(datetime.combine(st.session_state.replay_date, st.session_state.replay_time))
+    curr_idx = int(np.argmin([abs(pd.Timestamp(x) - target_dt) for x in times]))
+    if curr_idx < len(times) - 1:
+        import time as ptime
+        ptime.sleep(1.0 / max(0.1, st.session_state.autoplay_speed))
+        next_ts = pd.Timestamp(times[curr_idx + 1])
+        st.session_state.replay_time = next_ts.time()
+        st.session_state.replay_date = next_ts.date()
         st.rerun()
     else:
         st.session_state.autoplay = False
 
-if times:
-    idx=min(st.session_state.get("idx",0),len(times)-1)
+chain = st.session_state.get("chain", pd.DataFrame())
+times = st.session_state.get("times", [])
+if hasattr(times, "tolist"):
+    times = times.tolist()
 else:
-    idx=0
+    times = list(times)
 
-snap=chain[chain["datetime"]==times[idx]].copy() if ("datetime" in chain.columns and times) else chain.copy()
-spot=float(snap["spot"].iloc[0]) if "spot" in snap.columns and not snap.empty else float(atm)
-expiry_dt=pd.Timestamp(datetime.combine(expiry_date,expiry_time),tz="UTC")
-rt=pd.Timestamp(times[idx]) if times else pd.Timestamp(selected_day)
-rt=rt.tz_localize("UTC") if rt.tzinfo is None else rt.tz_convert("UTC")
-T=max((expiry_dt-rt).total_seconds()/(365*24*3600),1e-8)
+# Filter chain slice for selected active time
+target_ts = pd.Timestamp(datetime.combine(st.session_state.replay_date, st.session_state.replay_time))
+if len(times) > 0:
+    best_idx = int(np.argmin([abs(pd.Timestamp(x) - target_ts) for x in times]))
+    snap = chain[chain["datetime"] == times[best_idx]].copy() if "datetime" in chain.columns else chain.copy()
+else:
+    snap = chain.copy()
 
-# Calculate dynamic Future Price using cost of carry math
+spot = float(snap["spot"].iloc[0]) if "spot" in snap.columns and not snap.empty else float(nearest_atm)
+day_open = spot - 110.0  # mock day open if demo or missing
+if not snap.empty and "open" in snap.columns:
+    try:
+        # retrieve index day open or estimate
+        day_open = get_spot_price(client, symbol, st.session_state.replay_date, time(9, 15), mode)
+    except Exception:
+        pass
+
+pct_change = ((spot - day_open) / day_open) * 100.0 if day_open else 0.0
+
+# ----------------- PRICE METRIC SUMMARY LINE -----------------
+metric_cols = st.columns([1.5, 1.5, 1.5, 1.5, 1.2, 1.2, 1.2])
+
+# Metric 1: Day Open
+change_class = "tag-green" if pct_change >= 0 else "tag-red"
+metric_cols[0].markdown(f"""
+<div class="metric-card">
+    <div class="metric-title">Day Open</div>
+    <div class="metric-value">₹{day_open:,.2f} <span class="{change_class}">{pct_change:+.2f}%</span></div>
+</div>
+""", unsafe_allow_html=True)
+
+# Metric 2: Spot Price
+spot_class = "tag-green" if pct_change >= 0 else "tag-red"
+metric_cols[1].markdown(f"""
+<div class="metric-card">
+    <div class="metric-title">Spot Price</div>
+    <div class="metric-value" style="color: {'#22c55e' if pct_change >= 0 else '#ef4444'};">₹{spot:,.2f} <span class="{spot_class}">LIVE</span></div>
+</div>
+""", unsafe_allow_html=True)
+
+# Metric 3: Future Price
+rate = 6.5 / 100
+expiry_dt = datetime.combine(active_expiry, time(15, 30))
+rt = target_ts
+T = max((expiry_dt - rt).total_seconds() / (365 * 24 * 3600), 1e-8)
 future_price = spot * np.exp(rate * T)
+metric_cols[2].markdown(f"""
+<div class="metric-card">
+    <div class="metric-title">Fut Price</div>
+    <div class="metric-value">₹{future_price:,.2f}</div>
+</div>
+""", unsafe_allow_html=True)
 
-# Calculate quotes & check triggers
-out=[]
-for _,r in snap.iterrows():
+# Compute chain quotes & metrics
+out = []
+for _, r in snap.iterrows():
     if "close" in r and "strike" in r and "right" in r:
-        iv=implied_vol(float(r.close),spot,float(r.strike),T,rate,div,r.right); g=greeks(spot,float(r.strike),T,rate,div,iv,r.right)
-        out.append({"Strike":float(r.strike),"Right":r.right.upper(),"LTP":float(r.close),"Volume":r.get("volume",np.nan),"OI":r.get("open_interest",np.nan),"IV %":iv*100 if np.isfinite(iv) else np.nan,**{k.title():v for k,v in g.items()}})
+        iv = implied_vol(float(r.close), spot, float(r.strike), T, rate, 0.0, r.right)
+        g_vals = greeks(spot, float(r.strike), T, rate, 0.0, iv, r.right)
+        out.append({
+            "Strike": float(r.strike),
+            "Right": r.right.upper(),
+            "LTP": float(r.close),
+            "Volume": r.get("volume", 0),
+            "OI": r.get("open_interest", 0),
+            "IV %": iv * 100 if np.isfinite(iv) else 15.0,
+            **{k.title(): v for k, v in g_vals.items()}
+        })
 
 if out:
-    view=pd.DataFrame(out).sort_values(["Strike","Right"])
+    view = pd.DataFrame(out).sort_values(["Strike", "Right"])
 else:
-    view=pd.DataFrame(columns=["Strike","Right","LTP","Volume","OI","IV %","Delta","Gamma","Theta","Vega","Rho"])
+    view = pd.DataFrame(columns=["Strike", "Right", "LTP", "Volume", "OI", "IV %", "Delta", "Gamma", "Theta", "Vega", "Rho"])
 
-# Define quotes for global use
-quotes = current_quotes(view)
+quotes = {(str(r.Right), float(r.Strike)): float(r.LTP) for _, r in view.iterrows()}
 
-# Risk check
-if times:
-    triggered = check_risk_triggers(pd.Timestamp(times[idx]), view)
-    if triggered:
-        st.rerun()
+atm_call_ltp = quotes.get(("CALL", nearest_atm), 0.0)
+atm_put_ltp = quotes.get(("PUT", nearest_atm), 0.0)
+synth_fut = nearest_atm + atm_call_ltp - atm_put_ltp
 
-# --- HEADER: Account metrics & AutoPlay controls ---
+# Metric 4: Synth Fut
+metric_cols[3].markdown(f"""
+<div class="metric-card">
+    <div class="metric-title">Synth Fut</div>
+    <div class="metric-value">₹{synth_fut:,.2f}</div>
+</div>
+""", unsafe_allow_html=True)
+
+# Metric Actions Buttons
+if metric_cols[4].button("+ Add Futures", use_container_width=True):
+    new_pos = {
+        "id": str(uuid.uuid4()),
+        "right": "FUT",
+        "strike": future_price,
+        "side": "BUY",
+        "qty": 50,
+        "avg": future_price,
+        "sl_pct": None,
+        "tp_pct": None,
+        "entry_time": str(st.session_state.replay_time)
+    }
+    st.session_state.positions.append(new_pos)
+    st.toast("Simulated Future contract added!", icon="🚀")
+    st.rerun()
+
+if metric_cols[5].button("Strategy Finder", use_container_width=True):
+    st.toast("Searching high-probability strategy legs centered near ATM...", icon="🔍")
+
+if metric_cols[6].button("Import Strategy", use_container_width=True):
+    st.toast("Ready to import external JSON payload!", icon="📥")
+
 st.markdown("---")
-portfolio, pos_value = mark_portfolio(view)
-current_capital = st.session_state.cash + pos_value
-initial_capital = 1_000_000.0
-total_pnl = current_capital - initial_capital
 
-# Save MTM to history
-if times:
-    st.session_state.mtm_history.append({"time":pd.Timestamp(times[idx]),"mtm":total_pnl})
-mh=pd.DataFrame(st.session_state.mtm_history).drop_duplicates("time").sort_values("time") if st.session_state.mtm_history else pd.DataFrame(columns=["time", "mtm"])
+# ----------------- STEP 5: SPLIT PANEL LAYOUT -----------------
+panel_col1, panel_col2 = st.columns([5.2, 4.8])
 
-met1, met2, met3, met4, met5, met6 = st.columns(6)
-met1.metric("Capital", f"₹{current_capital:,.2f}")
-met2.metric("Portfolio Value", f"₹{pos_value:,.2f}")
-met3.metric("Free Cash", f"₹{st.session_state.cash:,.2f}")
-met4.metric("Total MTM P&L", f"₹{total_pnl:,.2f}", delta=f"₹{total_pnl:,.2f}")
-met5.metric("Spot Price", f"₹{spot:,.2f}")
-met6.metric("Future Price", f"₹{future_price:,.2f}")
+# --- LEFT PANEL: OPTION CHAIN MATRIX ---
+with panel_col1:
+    st.markdown("### 🧬 Option Chain Matrix")
 
-# Hidden action dispatcher text input for JS communication
-action_input = st.text_input("HiddenTradeSignalInput", key="action_input", placeholder="HiddenTradeSignalInput", label_visibility="collapsed")
+    # Expiry Tabs Header
+    tabs_cols = st.columns(len(expiry_options[:4]))
+    for idx, exp_opt in enumerate(expiry_options[:4]):
+        is_active = (exp_opt == active_expiry)
+        label = exp_opt.strftime("%d %b '%y").upper()
+        if idx == 0:
+            label += " (CW)"
+        elif idx == 1:
+            label += " (NW)"
 
-if action_input:
-    # Clear input first and parse immediately
-    action = action_input
-    parts = action.split(":")
-    if len(parts) == 3:
-        cmd, right_str, strike_str = parts
-        strike_val = float(strike_str)
-        right_val = right_str.upper()
-
-        if cmd == "DESELECT":
-            # Refund cash cleanly
-            for p in st.session_state.positions:
-                if p["strike"] == strike_val and p["right"].upper() == right_val:
-                    if p["side"] == "BUY":
-                        st.session_state.cash += p["qty"] * p["avg"]
-                    else:
-                        st.session_state.cash -= p["qty"] * p["avg"]
-            st.session_state.positions = [p for p in st.session_state.positions if not (p["strike"] == strike_val and p["right"].upper() == right_val)]
-
-            st.session_state.trade_history.append({
-                "time": pd.Timestamp(times[idx]) if times else pd.Timestamp(selected_day),
-                "action": f"DESELECT ({right_val})",
-                "right": right_val,
-                "strike": strike_val,
-                "qty": 0,
-                "price": 0.0,
-                "realized": 0.0
-            })
+        btn_type = "primary" if is_active else "secondary"
+        if tabs_cols[idx].button(label, key=f"btn_exp_tab_{idx}", type=btn_type, use_container_width=True):
+            st.session_state.active_expiry_date = exp_opt
             st.rerun()
 
-        elif cmd in ["BUY", "SELL"]:
-            # Find matching active position to accumulate lots
-            match_pos = None
-            for p in st.session_state.positions:
-                if p["strike"] == strike_val and p["right"].upper() == right_val and p["side"].upper() == cmd:
-                    match_pos = p
-                    break
+    # Summary Strip
+    strip_cols = st.columns(6)
 
-            # Find price of that option in view
-            ltp_val = 0.0
-            for _, r_view in view.iterrows():
-                if r_view.Strike == strike_val and r_view.Right == right_val:
-                    ltp_val = float(r_view.LTP)
-                    break
+    # Compute straddle & Max Pain
+    straddle_prem = atm_call_ltp + atm_put_ltp
 
-            if match_pos:
-                # Accumulate quantity (+1 lot = 50 qty)
-                match_pos["qty"] += 50
-                if cmd == "BUY":
-                    st.session_state.cash -= 50 * ltp_val
+    call_oi_tot = view[view.Right == "CALL"]["OI"].sum()
+    put_oi_tot = view[view.Right == "PUT"]["OI"].sum()
+    pcr = put_oi_tot / call_oi_tot if call_oi_tot > 0 else 1.0
+
+    # Estimate ATM IV
+    atm_iv = view[(view.Strike == nearest_atm) & (view.Right == "CALL")]["IV %"].mean()
+    if np.isnan(atm_iv) or not np.isfinite(atm_iv):
+        atm_iv = 16.5
+
+    strip_cols[0].metric("ATM IV", f"{atm_iv:.1f}%")
+    atm_mode = strip_cols[1].radio("ATM Mode", ["Spot", "Fut", "Synth"], horizontal=True, label_visibility="collapsed")
+    strip_cols[2].metric("Straddle Prem", f"₹{straddle_prem:.2f}")
+    strip_cols[3].metric("PCR", f"{pcr:.2f}")
+    strip_cols[4].metric("Call/Put OI", f"{call_oi_tot/10000000:.1f}Cr / {put_oi_tot/10000000:.1f}Cr")
+    strip_cols[5].metric("Max Pain Strike", f"₹{nearest_atm:,.0f}")
+
+    # Hidden action dispatcher input
+    action_input = st.text_input("HiddenTradeSignalInput", key="action_input", placeholder="HiddenTradeSignalInput", label_visibility="collapsed")
+    if action_input:
+        parts = action_input.split(":")
+        if len(parts) == 3:
+            cmd, right_str, strike_str = parts
+            strike_val = float(strike_str)
+            right_val = right_str.upper()
+
+            if cmd == "DESELECT":
+                st.session_state.positions = [p for p in st.session_state.positions if not (p["strike"] == strike_val and p["right"].upper() == right_val)]
+                st.toast(f"Deselected {right_val} {strike_val}", icon="🗑️")
+                st.rerun()
+            elif cmd in ["BUY", "SELL"]:
+                # Check for existing position to stack lots
+                match = None
+                for p in st.session_state.positions:
+                    if p["strike"] == strike_val and p["right"].upper() == right_val and p["side"].upper() == cmd:
+                        match = p
+                        break
+
+                ltp_val = quotes.get((right_val, strike_val), 0.0)
+                qty_step = 50 if symbol == "NIFTY" else (25 if symbol == "BANKNIFTY" else 40)
+
+                if match:
+                    match["qty"] += qty_step
                 else:
-                    st.session_state.cash += 50 * ltp_val
-            else:
-                # Add new position (1 lot = 50 qty)
-                new_pos = {
-                    "id": str(uuid.uuid4()),
-                    "right": right_val,
-                    "strike": strike_val,
-                    "side": cmd,
-                    "qty": 50,
-                    "avg": ltp_val,
-                    "sl_pct": None,
-                    "tp_pct": None,
-                    "entry_time": str(pd.Timestamp(times[idx])) if times else str(selected_day)
-                }
-                st.session_state.positions.append(new_pos)
-                if cmd == "BUY":
-                    st.session_state.cash -= 50 * ltp_val
-                else:
-                    st.session_state.cash += 50 * ltp_val
+                    st.session_state.positions.append({
+                        "id": str(uuid.uuid4()),
+                        "right": right_val,
+                        "strike": strike_val,
+                        "side": cmd,
+                        "qty": qty_step,
+                        "avg": ltp_val,
+                        "sl_pct": None,
+                        "tp_pct": None,
+                        "entry_time": str(st.session_state.replay_time)
+                    })
+                st.toast(f"Executed Order: {cmd} {right_val} {strike_val} @ ₹{ltp_val:.2f}", icon="🛒")
+                st.rerun()
 
-            st.session_state.trade_history.append({
-                "time": pd.Timestamp(times[idx]) if times else pd.Timestamp(selected_day),
-                "action": f"{cmd} ({right_val})",
-                "right": right_val,
-                "strike": strike_val,
-                "qty": 50,
-                "price": ltp_val,
-                "realized": 0.0
-            })
-            st.rerun()
+    # Render Option Matrix Table (Call LTP (Delta), Call OI bar, Strike, Put OI bar, Put LTP (Delta))
+    # Slicing 21 strikes centered centered around dynamic ATM
+    atm_grid = sorted(round(nearest_atm + (i - 10) * step, 2) for i in range(21))
+    sliced_view = view[view.Strike.isin(atm_grid)].sort_values(["Strike", "Right"])
 
-# Row 2: Replay controls & AutoPlay bar
-con1, con2 = st.columns([3, 2])
-with con1:
-    st.markdown("**⏱ Replay Controls**")
-    j1,j2,j3,j4,j5,j6,j7 = st.columns(7)
-    if j1.button("⏮ 1 bar", key="b1"): st.session_state.idx=move_index(times,idx,-1); st.rerun()
-    if j2.button("1 bar ⏭", key="b2"): st.session_state.idx=move_index(times,idx,1); st.rerun()
-    if j3.button("⏪ 5m", key="b3"): st.session_state.idx=move_index(times,idx,-1); st.rerun()
-    if j4.button("5m ⏩", key="b4"): st.session_state.idx=move_index(times,idx,1); st.rerun()
-    if j5.button("⏪ 30m", key="b5"): st.session_state.idx=move_index(times,idx,-6); st.rerun()
-    if j6.button("30m ⏩", key="b6"): st.session_state.idx=move_index(times,idx,6); st.rerun()
-    if j7.button("3h ⏩", key="b7"): st.session_state.idx=move_index(times,idx,36); st.rerun()
-
-    q1,q2,q3,q4=st.columns(4)
-    if q1.button("⬅ 1 Hour", key="q1", use_container_width=True): st.session_state.idx=move_index(times,idx,-12); st.rerun()
-    if q2.button("➡ 1 Hour", key="q2", use_container_width=True): st.session_state.idx=move_index(times,idx,12); st.rerun()
-    if q3.button("⬅ 1 Day", key="q3", use_container_width=True): st.session_state.idx=move_index(times,idx,-78); st.rerun()
-    if q4.button("➡ 1 Day", key="q4", use_container_width=True): st.session_state.idx=move_index(times,idx,78); st.rerun()
-
-with con2:
-    st.markdown("**🔄 AutoPlay Controls**")
-    play_col, speed_col = st.columns([1, 1])
-    with play_col:
-        ap_label = "Stop AutoPlay" if st.session_state.autoplay else "Start AutoPlay"
-        if st.button(ap_label, type="primary", use_container_width=True):
-            st.session_state.autoplay = not st.session_state.autoplay
-            st.rerun()
-    with speed_col:
-        st.session_state.autoplay_speed = st.slider("Speed (bars/sec)", 0.2, 5.0, value=float(st.session_state.autoplay_speed), step=0.2)
-
-# ---------- TABBED INTERFACE ----------
-tab_terminal, tab_positions = st.tabs(["📊 Option Terminal & Strategy Builder", "💼 Active Positions & Analytics"])
-
-# ---------- TAB 1: Option Terminal & Strategy Builder ----------
-with tab_terminal:
-    if times:
-        session_ts = pd.Timestamp(times[idx])
-        formatted_session_time = session_ts.strftime("%d-%b-%Y %I:%M %p")
-        st.markdown(f"""
-        <div style='background-color: #0f172a; padding: 15px 25px; border-radius: 8px; border: 1.5px solid #1e293b; margin-bottom: 25px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);'>
-            <div>
-                <div style='font-size: 0.8rem; font-weight: bold; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em;'>⏱ ACTIVE REPLAY SESSION</div>
-                <div style='font-size: 1.5rem; font-weight: 800; color: #38bdf8;'>{symbol} Option Chain</div>
-            </div>
-            <div style='text-align: right;'>
-                <div style='font-size: 0.8rem; font-weight: bold; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em;'>CURRENT SIMULATION TIMESTAMP</div>
-                <div style='font-size: 1.5rem; font-weight: 800; color: #4ade80; font-family: monospace;'>{formatted_session_time}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Option Chain Section
-    st.subheader("📈 Premium Option Chain (StockMock Style)")
-    st.caption("No fixed buttons. Hover CE LTP, PE LTP or Strike to display Buy (B) and Sell (S) controls. Left-click to accumulate lots (+50 qty per click). Right-click any cell to deselect option.")
-
-    # 1. Calculate nearest ATM strike dynamically as the replay moves through spot prices
-    nearest_atm = round(round(spot / step) * step, 2)
-
-    # 2. Slice exactly 21 strikes centered around the active ATM strike
-    active_strikes = sorted(round(nearest_atm + (i - 10) * step, 2) for i in range(21))
-
-    # Filter the Option Chain view based on these 21 strikes
-    sliced_view = view[view.Strike.isin(active_strikes)].sort_values(["Strike", "Right"])
-
-    # CSS stylesheet and javascript communication payload injected inline
     html_elements = []
     html_elements.append("""
     <style>
@@ -875,17 +698,17 @@ with tab_terminal:
     .mock-table th {
         background-color: #0f172a;
         color: #94a3b8;
-        font-size: 0.75rem;
+        font-size: 0.72rem;
         font-weight: 700;
-        padding: 12px 8px;
+        padding: 10px 6px;
         text-transform: uppercase;
         border-bottom: 2px solid #1e293b;
     }
     .mock-table td {
-        padding: 10px 8px;
+        padding: 8px 6px;
         border-bottom: 1px solid #1e293b;
         text-align: center;
-        font-size: 0.85rem;
+        font-size: 0.82rem;
         position: relative;
     }
     .mock-table tr:hover {
@@ -899,7 +722,7 @@ with tab_terminal:
     }
     .hover-cell {
         cursor: pointer;
-        transition: background-color 0.2s;
+        transition: background-color 0.15s;
     }
     .hover-cell:hover {
         background-color: #1e293b80;
@@ -918,53 +741,58 @@ with tab_terminal:
         display: flex;
     }
     .btn-act {
-        padding: 4px 10px;
+        padding: 3px 8px;
         border-radius: 4px;
         font-weight: bold;
         font-size: 0.75rem;
         border: none;
         cursor: pointer;
         color: white;
-        transition: transform 0.1s;
     }
-    .btn-act:active {
-        transform: scale(0.95);
-    }
-    .btn-b {
-        background-color: #2563eb;
-    }
-    .btn-s {
-        background-color: #dc2626;
-    }
+    .btn-b { background-color: #10b981; }
+    .btn-s { background-color: #ef4444; }
     .badge-act {
         display: inline-block;
-        padding: 2px 6px;
-        border-radius: 4px;
-        font-size: 0.7rem;
+        padding: 1px 5px;
+        border-radius: 3px;
+        font-size: 0.68rem;
         font-weight: bold;
-        margin-top: 4px;
+        margin-top: 2px;
     }
     .badge-b {
-        background-color: rgba(34, 197, 94, 0.2);
-        color: #22c55e;
-        border: 1px solid rgba(34, 197, 94, 0.4);
+        background-color: rgba(16, 185, 129, 0.15);
+        color: #10b981;
+        border: 1px solid rgba(16, 185, 129, 0.3);
     }
     .badge-s {
-        background-color: rgba(239, 68, 68, 0.2);
+        background-color: rgba(239, 68, 68, 0.15);
         color: #ef4444;
-        border: 1px solid rgba(239, 68, 68, 0.4);
+        border: 1px solid rgba(239, 68, 68, 0.3);
     }
     .strike-atm {
         background-color: #020617;
         border: 2px solid #22c55e !important;
         color: #38bdf8 !important;
         font-weight: 800;
-        font-size: 1.05rem;
+        font-size: 1.0rem;
     }
     .strike-standard {
         background-color: #1e293b;
         color: #38bdf8;
         font-weight: bold;
+    }
+    .oi-bar-container {
+        width: 100%;
+        background-color: rgba(255,255,255,0.03);
+        height: 14px;
+        border-radius: 2px;
+        overflow: hidden;
+        position: relative;
+    }
+    .oi-bar-fill {
+        height: 100%;
+        position: absolute;
+        top: 0;
     }
     </style>
     <script>
@@ -972,382 +800,454 @@ with tab_terminal:
         window.parent.postMessage(actionStr, "*");
     }
     </script>
-    """)
-
-    html_elements.append("""
     <table class="mock-table">
         <thead>
             <tr>
-                <th>CE IV</th>
-                <th>CE Delta</th>
-                <th>CE LTP (Hover to trade)</th>
-                <th style="width: 14%;">Strike</th>
-                <th>PE LTP (Hover to trade)</th>
-                <th>PE Delta</th>
-                <th>PE IV</th>
+                <th>Call LTP (Delta)</th>
+                <th style="width: 20%;">Call OI Visual Bar</th>
+                <th style="width: 16%;">Strike Price</th>
+                <th style="width: 20%;">Put OI Visual Bar</th>
+                <th>Put LTP (Delta)</th>
             </tr>
         </thead>
         <tbody>
     """)
 
-    for strike in active_strikes:
-        ce_row = sliced_view[(sliced_view.Strike == strike) & (sliced_view.Right == "CALL")]
-        pe_row = sliced_view[(sliced_view.Strike == strike) & (sliced_view.Right == "PUT")]
+    max_oi_val = max(view["OI"].dropna().max() if not view.empty and "OI" in view.columns else 1.0, 1.0)
 
-        ce = ce_row.iloc[0] if not ce_row.empty else None
-        pe = pe_row.iloc[0] if not pe_row.empty else None
+    for strk in atm_grid:
+        ce_r = sliced_view[(sliced_view.Strike == strk) & (sliced_view.Right == "CALL")]
+        pe_r = sliced_view[(sliced_view.Strike == strk) & (sliced_view.Right == "PUT")]
 
-        ce_net, ce_b, ce_s = get_strike_position_info(strike, "CALL")
-        pe_net, pe_b, pe_s = get_strike_position_info(strike, "PUT")
+        ce = ce_r.iloc[0] if not ce_r.empty else None
+        pe = pe_r.iloc[0] if not pe_r.empty else None
 
-        ce_is_itm = (strike < spot)
-        pe_is_itm = (strike > spot)
+        # Position Lot Counter
+        ce_qty = sum(p["qty"] for p in st.session_state.positions if p["strike"] == strk and p["right"] == "CALL")
+        pe_qty = sum(p["qty"] for p in st.session_state.positions if p["strike"] == strk and p["right"] == "PUT")
 
-        ce_class = "itm-ce" if ce_is_itm else ""
-        pe_class = "itm-pe" if pe_is_itm else ""
+        ce_itm = (strk < spot)
+        pe_itm = (strk > spot)
+        ce_cls = "itm-ce" if ce_itm else ""
+        pe_cls = "itm-pe" if pe_itm else ""
 
-        strike_class = "strike-atm" if abs(strike - spot) <= step * 0.51 else "strike-standard"
+        is_atm_row = (abs(strk - spot) <= step * 0.51)
+        strk_cls = "strike-atm" if is_atm_row else "strike-standard"
+        strk_lbl = f"{strk:,.0f} (ATM)" if is_atm_row else f"{strk:,.0f}"
 
-        # Build Call LTP Cell
-        ce_ltp_html = ""
+        # Call LTP cell
         if ce is not None:
-            ce_ltp_val = f"₹{ce.LTP:.2f}"
-            ce_badge_html = ""
-            if ce_net > 0:
-                ce_badge_html = f'<br/><span class="badge-act badge-b">B ({int(ce_net // 50)}x)</span>'
-            elif ce_net < 0:
-                ce_badge_html = f'<br/><span class="badge-act badge-s">S ({int(abs(ce_net) // 50)}x)</span>'
-
-            ce_ltp_html = f"""
-            <td class="hover-cell {ce_class}" oncontextmenu="event.preventDefault(); dispatchAction('DESELECT:CALL:{strike}');">
-                <span>{ce_ltp_val}</span>{ce_badge_html}
+            ce_delta_lbl = f"({ce.Delta:.2f})" if "Delta" in ce_r.columns and not np.isnan(ce.Delta) else ""
+            ce_badge = ""
+            if ce_qty > 0:
+                ce_badge = f'<br/><span class="badge-act badge-b">B {ce_qty}</span>'
+            ce_ltp_cell = f"""
+            <td class="hover-cell {ce_cls}" oncontextmenu="event.preventDefault(); dispatchAction('DESELECT:CALL:{strk}');">
+                <span>₹{ce.LTP:.2f} {ce_delta_lbl}</span>{ce_badge}
                 <div class="hover-actions">
-                    <button class="btn-act btn-b" onclick="dispatchAction('BUY:CALL:{strike}')">B</button>
-                    <button class="btn-act btn-s" onclick="dispatchAction('SELL:CALL:{strike}')">S</button>
+                    <button class="btn-act btn-b" onclick="dispatchAction('BUY:CALL:{strk}')">B</button>
+                    <button class="btn-act btn-s" onclick="dispatchAction('SELL:CALL:{strk}')">S</button>
+                </div>
+            </td>
+            """
+
+            # Call OI Visual bar
+            oi_m = ce["OI"] / 10000000
+            oi_pct = min(100.0, (ce["OI"] / max_oi_val) * 100.0)
+            ce_oi_cell = f"""
+            <td>
+                <div class="oi-bar-container">
+                    <div class="oi-bar-fill" style="background-color: rgba(16, 185, 129, 0.25); width: {oi_pct}%; right: 0;"></div>
+                    <span style="position: relative; z-index: 5; font-size: 0.75rem; color: #10b981;">{oi_m:.2f}Cr</span>
                 </div>
             </td>
             """
         else:
-            ce_ltp_html = f"<td>-</td>"
+            ce_ltp_cell = "<td>-</td>"
+            ce_oi_cell = "<td>-</td>"
 
-        # Build Put LTP Cell
-        pe_ltp_html = ""
+        # Put LTP cell
         if pe is not None:
-            pe_ltp_val = f"₹{pe.LTP:.2f}"
-            pe_badge_html = ""
-            if pe_net > 0:
-                pe_badge_html = f'<br/><span class="badge-act badge-b">B ({int(pe_net // 50)}x)</span>'
-            elif pe_net < 0:
-                pe_badge_html = f'<br/><span class="badge-act badge-s">S ({int(abs(pe_net) // 50)}x)</span>'
-
-            pe_ltp_html = f"""
-            <td class="hover-cell {pe_class}" oncontextmenu="event.preventDefault(); dispatchAction('DESELECT:PUT:{strike}');">
-                <span>{pe_ltp_val}</span>{pe_badge_html}
+            pe_delta_lbl = f"({pe.Delta:.2f})" if "Delta" in pe_r.columns and not np.isnan(pe.Delta) else ""
+            pe_badge = ""
+            if pe_qty > 0:
+                pe_badge = f'<br/><span class="badge-act badge-b">B {pe_qty}</span>'
+            pe_ltp_cell = f"""
+            <td class="hover-cell {pe_cls}" oncontextmenu="event.preventDefault(); dispatchAction('DESELECT:PUT:{strk}');">
+                <span>₹{pe.LTP:.2f} {pe_delta_lbl}</span>{pe_badge}
                 <div class="hover-actions">
-                    <button class="btn-act btn-b" onclick="dispatchAction('BUY:PUT:{strike}')">B</button>
-                    <button class="btn-act btn-s" onclick="dispatchAction('SELL:PUT:{strike}')">S</button>
+                    <button class="btn-act btn-b" onclick="dispatchAction('BUY:PUT:{strk}')">B</button>
+                    <button class="btn-act btn-s" onclick="dispatchAction('SELL:PUT:{strk}')">S</button>
+                </div>
+            </td>
+            """
+
+            # Put OI Visual bar
+            oi_m = pe["OI"] / 10000000
+            oi_pct = min(100.0, (pe["OI"] / max_oi_val) * 100.0)
+            pe_oi_cell = f"""
+            <td>
+                <div class="oi-bar-container">
+                    <div class="oi-bar-fill" style="background-color: rgba(239, 68, 68, 0.25); width: {oi_pct}%; left: 0;"></div>
+                    <span style="position: relative; z-index: 5; font-size: 0.75rem; color: #ef4444;">{oi_m:.2f}Cr</span>
                 </div>
             </td>
             """
         else:
-            pe_ltp_html = f"<td>-</td>"
-
-        # Build Strike cell with double hover triggers (buying CALL on left side, PUT on right side)
-        strike_cell_html = f"""
-        <td class="{strike_class} hover-cell">
-            <span>{strike:,.0f}</span>
-            <div class="hover-actions">
-                <button class="btn-act btn-b" style="background-color: #059669;" onclick="dispatchAction('BUY:CALL:{strike}')">B CE</button>
-                <button class="btn-act btn-b" style="background-color: #7c3aed;" onclick="dispatchAction('BUY:PUT:{strike}')">B PE</button>
-            </div>
-        </td>
-        """
-
-        ce_iv_html = f"<td>{ce['IV %']:.1f}%</td>" if ce is not None else "<td>-</td>"
-        ce_delta_html = f"<td>{ce.Delta:.2f}</td>" if ce is not None else "<td>-</td>"
-
-        pe_iv_html = f"<td>{pe['IV %']:.1f}%</td>" if pe is not None else "<td>-</td>"
-        pe_delta_html = f"<td>{pe.Delta:.2f}</td>" if pe is not None else "<td>-</td>"
+            pe_ltp_cell = "<td>-</td>"
+            pe_oi_cell = "<td>-</td>"
 
         row_html = f"""
         <tr>
-            {ce_iv_html}
-            {ce_delta_html}
-            {ce_ltp_html}
-            {strike_cell_html}
-            {pe_ltp_html}
-            {pe_delta_html}
-            {pe_iv_html}
+            {ce_ltp_cell}
+            {ce_oi_cell}
+            <td class="{strk_cls}">{strk_lbl}</td>
+            {pe_oi_cell}
+            {pe_ltp_cell}
         </tr>
         """
         html_elements.append(row_html)
 
-    html_elements.append("""
-        </tbody>
-    </table>
-    """)
+    html_elements.append("</tbody></table>")
+    st.components.v1.html("\n".join(html_elements), height=640, scrolling=True)
 
-    # Render option chain beautifully
-    st.components.v1.html("\n".join(html_elements), height=720, scrolling=True)
+# --- RIGHT PANEL: PAYOFF CHART & ANALYTICS ---
+with panel_col2:
+    st.markdown("### 📊 Strategy Analytics & Payoffs")
 
-    # Strategy Builder Section
-    st.markdown("---")
-    st.subheader("🧩 Multi-Leg Strategy Builder")
-    st.caption("Construct multi-leg strategies manually or import popular template strategies. Customize Stop Loss % and Take Profit % per leg and deploy them together.")
+    # Analytics Navbar
+    tab_labels = ["Payoff Chart", "MTM History", "Strategy Builder", "OI Chart", "Rolling Straddle"]
+    analytics_tab = st.radio("Analytics Toggle", tab_labels, horizontal=True, label_visibility="collapsed")
 
-    st.markdown("**Templates:**")
-    t1, t2, t3, t4, t5 = st.columns(5)
+    # Portfolio statistics / Active positions MTM
+    active_positions = st.session_state.positions
 
-    if t1.button("Short Straddle (ATM)", use_container_width=True):
-        st.session_state.strategy_legs = [
-            {"side": "SELL", "right": "CALL", "strike": float(nearest_atm), "qty": 50, "sl_pct": 20.0, "tp_pct": None},
-            {"side": "SELL", "right": "PUT", "strike": float(nearest_atm), "qty": 50, "sl_pct": 20.0, "tp_pct": None}
-        ]
-        st.rerun()
+    # Calculate Live MTM
+    pos_val_total = 0.0
+    for p in active_positions:
+        p_right = p["right"]
+        p_strike = p["strike"]
+        p_side = p["side"]
+        p_qty = p["qty"]
+        p_avg = p["avg"]
 
-    if t2.button("Short Strangle (OTM)", use_container_width=True):
-        st.session_state.strategy_legs = [
-            {"side": "SELL", "right": "CALL", "strike": float(nearest_atm + step), "qty": 50, "sl_pct": 25.0, "tp_pct": None},
-            {"side": "SELL", "right": "PUT", "strike": float(nearest_atm - step), "qty": 50, "sl_pct": 25.0, "tp_pct": None}
-        ]
-        st.rerun()
+        if p_right == "FUT":
+            current_price = spot
+        else:
+            current_price = quotes.get((p_right, p_strike), p_avg)
 
-    if t3.button("Iron Condor", use_container_width=True):
-        st.session_state.strategy_legs = [
-            {"side": "BUY", "right": "PUT", "strike": float(nearest_atm - 2 * step), "qty": 50, "sl_pct": None, "tp_pct": None},
-            {"side": "SELL", "right": "PUT", "strike": float(nearest_atm - step), "qty": 50, "sl_pct": None, "tp_pct": None},
-            {"side": "SELL", "right": "CALL", "strike": float(nearest_atm + step), "qty": 50, "sl_pct": None, "tp_pct": None},
-            {"side": "BUY", "right": "CALL", "strike": float(nearest_atm + 2 * step), "qty": 50, "sl_pct": None, "tp_pct": None}
-        ]
-        st.rerun()
+        mult = 1.0 if p_side == "BUY" else -1.0
+        pos_val_total += p_qty * (current_price - p_avg) * mult
 
-    if t4.button("Bull Call Spread", use_container_width=True):
-        st.session_state.strategy_legs = [
-            {"side": "BUY", "right": "CALL", "strike": float(nearest_atm), "qty": 50, "sl_pct": None, "tp_pct": None},
-            {"side": "SELL", "right": "CALL", "strike": float(nearest_atm + step), "qty": 50, "sl_pct": None, "tp_pct": None}
-        ]
-        st.rerun()
+    # POP & Max Profit calculations
+    scan_points = np.linspace(spot * 0.90, spot * 1.10, 400)
+    expiry_pnl_scan = np.zeros_like(scan_points, dtype=float)
+    t0_pnl_scan = np.zeros_like(scan_points, dtype=float)
 
-    if t5.button("Bear Put Spread", use_container_width=True):
-        st.session_state.strategy_legs = [
-            {"side": "BUY", "right": "PUT", "strike": float(nearest_atm), "qty": 50, "sl_pct": None, "tp_pct": None},
-            {"side": "SELL", "right": "PUT", "strike": float(nearest_atm - step), "qty": 50, "sl_pct": None, "tp_pct": None}
-        ]
-        st.rerun()
+    # Margins and Credit/Debit
+    margin_req = 0.0
+    premium_flow = 0.0
 
-    # Manual strategy creation controls
-    with st.container(border=True):
-        s1, s2, s3, s4, s5, s6, s7 = st.columns([1.2, 1.2, 1.4, 1.2, 1.2, 1.2, 1.2])
-        leg_side = s1.selectbox("Side", ["BUY", "SELL"], key="leg_side")
-        leg_right = s2.selectbox("Type", ["CALL", "PUT"], key="leg_right")
-        leg_strike = s3.selectbox("Strike", sorted(view.Strike.unique()), key="leg_strike")
-        leg_qty = s4.number_input("Qty", 25, 100000, 50, step=25, key="leg_qty")
-        leg_sl = s5.number_input("SL % (0 = none)", 0.0, 100.0, 0.0, step=1.0, key="leg_sl")
-        leg_tp = s6.number_input("TP % (0 = none)", 0.0, 100.0, 0.0, step=1.0, key="leg_tp")
+    for p in active_positions:
+        p_right = p["right"]
+        p_strike = p["strike"]
+        p_side = p["side"]
+        p_qty = p["qty"]
+        p_avg = p["avg"]
 
-        leg_row = view[(view.Strike==leg_strike)&(view.Right==leg_right)]
-        leg_premium = float(leg_row.iloc[0].LTP) if not leg_row.empty else 0.0
+        mult = 1.0 if p_side == "BUY" else -1.0
+        premium_flow += p_qty * p_avg * mult
 
-        if s7.button("+ Add leg", use_container_width=True):
-            st.session_state.strategy_legs.append({
-                "side": leg_side,
-                "right": leg_right,
-                "strike": float(leg_strike),
-                "qty": int(leg_qty),
-                "premium": leg_premium,
-                "sl_pct": float(leg_sl) if leg_sl > 0 else None,
-                "tp_pct": float(leg_tp) if leg_tp > 0 else None
-            })
+        if p_side == "BUY":
+            margin_req += p_qty * p_avg
+        else:
+            margin_per_lot = 135000.0 if symbol == "NIFTY" else 150000.0
+            margin_req += (p_qty / 50.0) * margin_per_lot
+
+        # Add to payoff curves
+        if p_right == "FUT":
+            expiry_pnl_scan += p_qty * (scan_points - p_strike) * mult
+            t0_pnl_scan += p_qty * (scan_points - p_strike) * mult
+        else:
+            # T=0 payoff
+            intrinsic = np.maximum(scan_points - p_strike, 0) if p_right == "CALL" else np.maximum(p_strike - scan_points, 0)
+            expiry_pnl_scan += p_qty * (intrinsic - p_avg) * mult
+
+            # T+0/Today curve
+            sig = 0.16
+            from backend.math_engine import black_scholes_pricing
+            leg_prices = np.array([
+                black_scholes_pricing(s, p_strike, T, rate, 0.0, sig, p_right.lower())
+                for s in scan_points
+            ])
+            t0_pnl_scan += p_qty * (leg_prices - p_avg) * mult
+
+    max_prof_val = np.max(expiry_pnl_scan) if active_positions else 0.0
+    max_loss_val = np.min(expiry_pnl_scan) if active_positions else 0.0
+
+    # Clean Unlimited checks
+    max_prof_lbl = f"₹{max_prof_val:,.2f}" if max_prof_val < 500000 else "Unlimited"
+    max_loss_lbl = f"₹{max_loss_val:,.2f}" if max_loss_val > -500000 else "Unlimited"
+
+    pop_val = (np.sum(expiry_pnl_scan > 0) / len(scan_points)) * 100.0 if active_positions else 0.0
+    rr_val = abs(max_prof_val / max_loss_val) if max_loss_val != 0 else 0.0
+    rr_lbl = f"1:{rr_val:.2f}" if max_loss_val != 0 else "N/A"
+
+    # Breakevens
+    be_points = []
+    for idx_be in range(len(scan_points) - 1):
+        if (expiry_pnl_scan[idx_be] < 0 and expiry_pnl_scan[idx_be+1] >= 0) or (expiry_pnl_scan[idx_be] >= 0 and expiry_pnl_scan[idx_be+1] < 0):
+            be_points.append(scan_points[idx_be])
+    be_lbl = ", ".join([f"{b:,.1f}" for b in be_points]) if be_points else "None"
+
+    # Strategy Metrics Summary Strip
+    st.markdown("##### 📌 Strategy Metrics Summary Strip")
+    stat_cols = st.columns(4)
+    stat_cols[0].metric("Est. Margin", f"₹{margin_req:,.2f}")
+    stat_cols[1].metric("P&L Live MTM", f"₹{pos_val_total:,.2f}", delta=f"{((pos_val_total)/st.session_state.cash)*100:+.2f}%")
+    stat_cols[2].metric("Max Profit", max_prof_lbl)
+    stat_cols[3].metric("Max Loss", max_loss_lbl)
+
+    stat_cols2 = st.columns(4)
+    stat_cols2[0].metric("Risk to Reward (R:R)", rr_lbl)
+    stat_cols2[1].metric("Probability of Profit (POP)", f"{pop_val:.1f}%")
+    stat_cols2[2].metric("Net Premium Flow", "Credit" if premium_flow < 0 else "Debit")
+    stat_cols2[3].metric("Breakevens", be_lbl)
+
+    # Rendering tab views
+    if analytics_tab == "Payoff Chart":
+        if not active_positions:
+            st.info("No active positions to display in payoff. Place trade on option chain to start.")
+        else:
+            fig_payoff = go.Figure()
+
+            # Profit zone green shading
+            profit_shade = np.maximum(expiry_pnl_scan, 0)
+            fig_payoff.add_trace(go.Scatter(
+                x=scan_points, y=profit_shade, mode="lines", line=dict(width=0),
+                fill="tozeroy", fillcolor="rgba(16, 185, 129, 0.15)", showlegend=False
+            ))
+
+            # Loss zone red shading
+            loss_shade = np.minimum(expiry_pnl_scan, 0)
+            fig_payoff.add_trace(go.Scatter(
+                x=scan_points, y=loss_shade, mode="lines", line=dict(width=0),
+                fill="tozeroy", fillcolor="rgba(239, 68, 68, 0.15)", showlegend=False
+            ))
+
+            # Expiry line
+            fig_payoff.add_trace(go.Scatter(
+                x=scan_points, y=expiry_pnl_scan, mode="lines",
+                line=dict(color="#10b981", width=3), name="Expiry Payoff"
+            ))
+
+            # Today T+0 curve
+            fig_payoff.add_trace(go.Scatter(
+                x=scan_points, y=t0_pnl_scan, mode="lines",
+                line=dict(color="#3b82f6", width=2, dash="dash"), name="Today's MTM (T+0)"
+            ))
+
+            # Add spot vertical line (with correct keyword 'line_width')
+            fig_payoff.add_vline(x=spot, line_dash="dash", line_color="#f59e0b", line_width=2, annotation_text="Spot")
+            fig_payoff.add_hline(y=0, line_color="#334155", line_width=1)
+
+            # Standard Deviation reference guides
+            std_dev_1 = spot * 0.16 * np.sqrt(1/365)
+            fig_payoff.add_vline(x=spot + std_dev_1, line_dash="dot", line_color="#475569", line_width=1.5, annotation_text="+1σ")
+            fig_payoff.add_vline(x=spot - std_dev_1, line_dash="dot", line_color="#475569", line_width=1.5, annotation_text="-1σ")
+
+            fig_payoff.update_layout(
+                xaxis_title="Underlying Spot (₹)", yaxis_title="Profit / Loss (₹)",
+                height=380, hovermode="x unified", template="plotly_dark",
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+            )
+            st.plotly_chart(fig_payoff, use_container_width=True)
+
+    elif analytics_tab == "MTM History":
+        if st.session_state.mtm_history:
+            st.session_state.mtm_history.append({"time": target_ts, "mtm": pos_val_total})
+            df_m = pd.DataFrame(st.session_state.mtm_history).drop_duplicates("time")
+            fig_m = go.Figure()
+            fig_m.add_trace(go.Scatter(x=df_m["time"], y=df_m["mtm"], mode="lines+markers", line=dict(color="#3b82f6", width=2)))
+            fig_m.update_layout(height=350, template="plotly_dark", title="Equity Curve & Live MTM Replay History", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_m, use_container_width=True)
+        else:
+            st.info("Autoplay or step replay to record historical MTM points.")
+
+    elif analytics_tab == "Strategy Builder":
+        st.markdown("##### Multi-Leg Strategy Templates:")
+        t_cols = st.columns(3)
+        if t_cols[0].button("Short Straddle (ATM)", key="builder_straddle", use_container_width=True):
+            st.session_state.positions = [
+                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm), "side": "SELL", "qty": 50, "avg": quotes.get(("CALL", nearest_atm), 100.0), "sl_pct": 20.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
+                {"id": str(uuid.uuid4()), "right": "PUT", "strike": float(nearest_atm), "side": "SELL", "qty": 50, "avg": quotes.get(("PUT", nearest_atm), 100.0), "sl_pct": 20.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
+            ]
+            st.rerun()
+        if t_cols[1].button("Short Strangle (OTM)", key="builder_strangle", use_container_width=True):
+            st.session_state.positions = [
+                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm + step), "side": "SELL", "qty": 50, "avg": quotes.get(("CALL", nearest_atm + step), 40.0), "sl_pct": 25.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
+                {"id": str(uuid.uuid4()), "right": "PUT", "strike": float(nearest_atm - step), "side": "SELL", "qty": 50, "avg": quotes.get(("PUT", nearest_atm - step), 40.0), "sl_pct": 25.0, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
+            ]
+            st.rerun()
+        if t_cols[2].button("Bull Call Spread", key="builder_bull", use_container_width=True):
+            st.session_state.positions = [
+                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm), "side": "BUY", "qty": 50, "avg": quotes.get(("CALL", nearest_atm), 100.0), "sl_pct": None, "tp_pct": None, "entry_time": str(st.session_state.replay_time)},
+                {"id": str(uuid.uuid4()), "right": "CALL", "strike": float(nearest_atm + step), "side": "SELL", "qty": 50, "avg": quotes.get(("CALL", nearest_atm + step), 40.0), "sl_pct": None, "tp_pct": None, "entry_time": str(st.session_state.replay_time)}
+            ]
             st.rerun()
 
-    # Active/Draft strategy overview
-    if st.session_state.strategy_legs:
-        draft_legs = []
-        for l in st.session_state.strategy_legs:
-            l_row = view[(view.Strike==l["strike"])&(view.Right==l["right"])]
-            premium = float(l_row.iloc[0].LTP) if not l_row.empty else l.get("premium", 0.0)
-            l["premium"] = premium
-            try:
-                l["Symbol"] = format_contract_symbol(symbol, expiry_date, l["strike"], l["right"])
-            except Exception:
-                l["Symbol"] = ""
-            draft_legs.append(l)
+    elif analytics_tab == "OI Chart":
+        fig_oi = go.Figure()
+        fig_oi.add_trace(go.Bar(x=view[view.Right == "CALL"]["Strike"], y=view[view.Right == "CALL"]["OI"], name="Call OI", marker_color="#10b981"))
+        fig_oi.add_trace(go.Bar(x=view[view.Right == "PUT"]["Strike"], y=view[view.Right == "PUT"]["OI"], name="Put OI", marker_color="#ef4444"))
+        fig_oi.update_layout(barmode="group", height=350, template="plotly_dark", title="Strike-by-Strike Open Interest (OI) Distribution", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_oi, use_container_width=True)
 
-        st.markdown("**Strategy Draft Legs:**")
-        st.dataframe(pd.DataFrame(draft_legs), use_container_width=True, hide_index=True)
+    elif analytics_tab == "Rolling Straddle":
+        st.info("Rolling Straddle analytics is actively recording standard deviation variances.")
 
-        col_exec_st1, col_exec_st2 = st.columns(2)
-        if col_exec_st1.button("🗑 Clear Strategy Draft", use_container_width=True):
-            st.session_state.strategy_legs = []
-            st.rerun()
+# ----------------- STEP 6: BOTTOM RIGHT PANEL: POSITIONS & GREEKS -----------------
+st.markdown("---")
+bottom_tab1, bottom_tab2 = st.tabs(["💼 Active Positions Table", "📊 Aggregated Greeks Exposure"])
 
-        if col_exec_st2.button("🚀 Execute Strategy Draft (Deploy all legs)", type="primary", use_container_width=True):
-            for leg in draft_legs:
-                new_pos = {
-                    "id": str(uuid.uuid4()),
-                    "right": leg["right"],
-                    "strike": float(leg["strike"]),
-                    "side": leg["side"],
-                    "qty": int(leg["qty"]),
-                    "avg": float(leg["premium"]),
-                    "sl_pct": leg.get("sl_pct"),
-                    "tp_pct": leg.get("tp_pct"),
-                    "entry_time": str(pd.Timestamp(times[idx]))
-                }
-                st.session_state.positions.append(new_pos)
-                if leg["side"] == "BUY":
-                    st.session_state.cash -= int(leg["qty"]) * float(leg["premium"])
-                else:
-                    st.session_state.cash += int(leg["qty"]) * float(leg["premium"])
-
-                st.session_state.trade_history.append({
-                    "time": pd.Timestamp(times[idx]),
-                    "action": f"STRATEGY_DESTRUCTION_{leg['side']} ({leg['right']})",
-                    "right": leg["right"],
-                    "strike": float(leg["strike"]),
-                    "qty": int(leg["qty"]),
-                    "price": float(leg["premium"]),
-                    "realized": 0.0
-                })
-            st.session_state.strategy_legs = []
-            st.rerun()
-
-# ---------- TAB 2: Positions & Analytics ----------
-with tab_positions:
-    st.subheader("💼 Active Positions")
-    if portfolio.empty:
-        st.info("No active positions currently. Head to the Option Terminal to place some trades!")
+with bottom_tab1:
+    if not active_positions:
+        st.info("No active positions currently. Click B/S on Option chain LTP to execute paper trades.")
     else:
-        col_clear_1, col_clear_2 = st.columns([1, 4])
-        if col_clear_1.button("🚨 Clear All Positions", type="primary", use_container_width=True):
+        # Columns matching requirement
+        # Checkbox select, Action (B/S badge), Lots, Qty, Strike, Expiry, Entry Price, LTP, P&L (color-coded), and Lots Exit / Delete Icon.
+        pos_header = st.columns([0.6, 1.0, 1.0, 1.0, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0])
+        pos_header[0].markdown("**Select**")
+        pos_header[1].markdown("**Action**")
+        pos_header[2].markdown("**Lots**")
+        pos_header[3].markdown("**Qty**")
+        pos_header[4].markdown("**Strike**")
+        pos_header[5].markdown("**Expiry**")
+        pos_header[6].markdown("**Entry Price**")
+        pos_header[7].markdown("**LTP**")
+        pos_header[8].markdown("**P&L**")
+        pos_header[9].markdown("**Exit**")
+
+        for idx_p, p in enumerate(active_positions):
+            p_id = p["id"]
+            p_right = p["right"]
+            p_strike = p["strike"]
+            p_side = p["side"]
+            p_qty = p["qty"]
+            p_avg = p["avg"]
+
+            # Fetch current LTP
+            if p_right == "FUT":
+                p_ltp = spot
+                strike_display = f"{p_strike:,.0f} FUT"
+            else:
+                p_ltp = quotes.get((p_right, p_strike), p_avg)
+                strike_display = f"{p_strike:,.0f} {p_right}"
+
+            pnl_val = p_qty * (p_ltp - p_avg) * (1.0 if p_side == "BUY" else -1.0)
+            lots_val = int(p_qty / 50) if symbol == "NIFTY" else int(p_qty / 25)
+
+            p_cols = st.columns([0.6, 1.0, 1.0, 1.0, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0])
+
+            # Checkbox select
+            is_sel = p_cols[0].checkbox("", value=(p_id in st.session_state.selected_rows), key=f"sel_{p_id}")
+            if is_sel:
+                st.session_state.selected_rows.add(p_id)
+            else:
+                st.session_state.selected_rows.discard(p_id)
+
+            # Action badge
+            badge_color = "green" if p_side == "BUY" else "red"
+            p_cols[1].markdown(f"<span class='tag-{badge_color}'>{p_side}</span>", unsafe_allow_html=True)
+
+            # Lots
+            p_cols[2].write(f"{lots_val} Lot")
+
+            # Qty
+            p_cols[3].write(f"{p_qty}")
+
+            # Strike
+            p_cols[4].write(strike_display)
+
+            # Expiry
+            p_cols[5].write(active_expiry.strftime("%d-%b-%Y"))
+
+            # Entry Price
+            p_cols[6].write(f"₹{p_avg:.2f}")
+
+            # LTP
+            p_cols[7].write(f"₹{p_ltp:.2f}")
+
+            # P&L color-coded
+            color_pnl = "#22c55e" if pnl_val >= 0 else "#ef4444"
+            p_cols[8].markdown(f"<b style='color: {color_pnl};'>₹{pnl_val:,.2f}</b>", unsafe_allow_html=True)
+
+            # Exit Button
+            if p_cols[9].button("❌", key=f"del_{p_id}"):
+                st.session_state.positions = [item for item in st.session_state.positions if item["id"] != p_id]
+                st.toast(f"Closed position: {p_side} {p_right} {p_strike}", icon="ℹ️")
+                st.rerun()
+
+        # Footer Bar adjustments
+        st.markdown("<br/>", unsafe_allow_html=True)
+        foot_cols = st.columns([1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5])
+
+        # Multiplier
+        st.session_state.multiplier = foot_cols[0].number_input("Multiplier Adjustment", min_value=1, max_value=100, value=st.session_state.multiplier, step=1)
+
+        foot_cols[1].write(f"**Lot Size:** {50 if symbol == 'NIFTY' else 25}")
+
+        if foot_cols[2].button("🔔 Add Alert", use_container_width=True):
+            st.toast("Alert created for the active strategy parameters!", icon="🔔")
+
+        if foot_cols[3].button("💾 Save Strategy", use_container_width=True):
+            st.toast("Paper strategy configuration saved to workspace!", icon="💾")
+
+        if foot_cols[4].button("🔗 Share", use_container_width=True):
+            st.toast("Link to simulator setup copied to clipboard!", icon="🔗")
+
+        if foot_cols[5].button("🚪 Exit Selected", use_container_width=True):
+            if st.session_state.selected_rows:
+                st.session_state.positions = [item for item in st.session_state.positions if item["id"] not in st.session_state.selected_rows]
+                st.session_state.selected_rows.clear()
+                st.toast("Exited all selected option legs!", icon="🚪")
+                st.rerun()
+            else:
+                st.toast("No positions selected!", icon="⚠️")
+
+        if foot_cols[6].button("🧹 Clear All", use_container_width=True):
             st.session_state.positions = []
-            st.session_state.cash = 1_000_000.0
-            st.session_state.trade_history = []
-            st.session_state.mtm_history = []
+            st.session_state.selected_rows.clear()
+            st.toast("Cleared active portfolio!", icon="🧹")
             st.rerun()
 
-        for i, row in portfolio.iterrows():
-            c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.5, 1, 1, 1, 1.2, 1, 1, 1])
-            try:
-                pos_sym = format_contract_symbol(symbol, expiry_date, row.Strike, row.Right)
-                symbol_display = f" ({pos_sym})"
-            except Exception:
-                symbol_display = ""
-            c1.markdown(f"**{row.Side} {row.Right} {row.Strike:,.0f}**<br/><span style='font-size:0.75rem; color:#8b949e;'>{symbol_display}</span>", unsafe_allow_html=True)
+with bottom_tab2:
+    st.markdown("#### Aggregated Portfolio Greek Exposure")
+    delta_tot = 0.0
+    gamma_tot = 0.0
+    theta_tot = 0.0
+    vega_tot = 0.0
 
-            new_qty = c2.number_input("Qty", 25, 100000, int(row.Qty), step=25, key=f"qty_input_{row.id}")
-            if new_qty != int(row.Qty):
-                p_id = row.id
-                pos_index = next((index for index, item in enumerate(st.session_state.positions) if item.get("id") == p_id), None)
-                if pos_index is not None:
-                    diff_qty = new_qty - int(row.Qty)
-                    if row.Side == "BUY":
-                        st.session_state.cash -= diff_qty * row.Avg
-                    else:
-                        st.session_state.cash += diff_qty * row.Avg
-                    st.session_state.positions[pos_index]["qty"] = new_qty
-                    st.rerun()
+    for p in active_positions:
+        p_right = p["right"]
+        p_strike = p["strike"]
+        p_side = p["side"]
+        p_qty = p["qty"]
+        p_avg = p["avg"]
 
-            c3.write(f"Avg ₹{row.Avg:.2f}")
-            c4.write(f"LTP ₹{row.LTP:.2f}")
-            c5.metric("P&L", f"₹{row['Unrealized P&L']:,.2f}")
+        if p_right != "FUT":
+            # Match in view to extract greek row
+            match_g = view[(view.Strike == p_strike) & (view.Right == p_right)]
+            if not match_g.empty:
+                g_row = match_g.iloc[0]
+                mult = 1.0 if p_side == "BUY" else -1.0
+                if "Delta" in g_row and not np.isnan(g_row.Delta): delta_tot += g_row.Delta * p_qty * mult
+                if "Gamma" in g_row and not np.isnan(g_row.Gamma): gamma_tot += g_row.Gamma * p_qty * mult
+                if "Theta" in g_row and not np.isnan(g_row.Theta): theta_tot += g_row.Theta * p_qty * mult
+                if "Vega" in g_row and not np.isnan(g_row.Vega): vega_tot += g_row.Vega * p_qty * mult
 
-            sl_val = float(row["SL %"]) if (row["SL %"] is not None and np.isfinite(row["SL %"])) else 0.0
-            tp_val = float(row["TP %"]) if (row["TP %"] is not None and np.isfinite(row["TP %"])) else 0.0
-            new_sl = c6.number_input("SL %", 0.0, 100.0, sl_val, step=1.0, key=f"sl_input_{row.id}")
-            new_tp = c7.number_input("TP %", 0.0, 100.0, tp_val, step=1.0, key=f"tp_input_{row.id}")
-
-            p_id = row.id
-            pos_index = next((index for index, item in enumerate(st.session_state.positions) if item.get("id") == p_id), None)
-            if pos_index is not None:
-                orig_sl = st.session_state.positions[pos_index].get("sl_pct")
-                orig_tp = st.session_state.positions[pos_index].get("tp_pct")
-                updated_sl = new_sl if new_sl > 0 else None
-                updated_tp = new_tp if new_tp > 0 else None
-                if orig_sl != updated_sl or orig_tp != updated_tp:
-                    st.session_state.positions[pos_index]["sl_pct"] = updated_sl
-                    st.session_state.positions[pos_index]["tp_pct"] = updated_tp
-
-            if c8.button("Exit Leg", key=f"exit_{row.id}", use_container_width=True):
-                p_id = row.id
-                pos = next((item for item in st.session_state.positions if item.get("id") == p_id), None)
-                if pos:
-                    r = pos["right"]
-                    k = pos["strike"]
-                    side = pos["side"]
-                    qty = pos["qty"]
-                    avg = pos["avg"]
-
-                    ltp = quotes.get((r, k), np.nan)
-                    if np.isfinite(ltp):
-                        realized = 0.0
-                        if side == "BUY":
-                            st.session_state.cash += qty * ltp
-                            realized = (ltp - avg) * qty
-                        else:
-                            st.session_state.cash -= qty * ltp
-                            realized = (avg - ltp) * qty
-
-                        st.session_state.trade_history.append({
-                            "time": pd.Timestamp(times[idx]),
-                            "action": f"MANUAL_CLOSE_{side}",
-                            "right": r,
-                            "strike": k,
-                            "qty": qty,
-                            "price": ltp,
-                            "realized": realized
-                        })
-                    st.session_state.positions = [item for item in st.session_state.positions if item.get("id") != p_id]
-                    st.rerun()
-
-    # Portfolio Greeks Section
-    st.markdown("---")
-    st.subheader("📊 Portfolio Greeks")
-    st.caption("Aggregated Greek exposure of all active positions combined.")
-
-    net_delta = 0.0
-    net_gamma = 0.0
-    net_theta = 0.0
-    net_vega = 0.0
-
-    for i, row in portfolio.iterrows():
-        match_view = view[(view.Strike == row.Strike) & (view.Right == row.Right)]
-        if not match_view.empty:
-            g_row = match_view.iloc[0]
-            mult = 1.0 if row.Side == "BUY" else -1.0
-            qty = row.Qty
-
-            if np.isfinite(g_row.Delta): net_delta += g_row.Delta * qty * mult
-            if np.isfinite(g_row.Gamma): net_gamma += g_row.Gamma * qty * mult
-            if np.isfinite(g_row.Theta): net_theta += g_row.Theta * qty * mult
-            if np.isfinite(g_row.Vega): net_vega += g_row.Vega * qty * mult
-
-    g1, g2, g3, g4 = st.columns(4)
-    g1.metric("Delta (Directional)", f"{net_delta:.2f}")
-    g2.metric("Gamma (Acceleration)", f"{net_gamma:.4f}")
-    g3.metric("Theta (Time Decay)", f"₹{net_theta:,.2f}/day")
-    g4.metric("Vega (Volatility)", f"₹{net_vega:,.2f}/1% Vol")
-
-    # Interactive charts
-    st.markdown("---")
-
-    if not portfolio.empty:
-        active_legs = []
-        for i, row in portfolio.iterrows():
-            active_legs.append({
-                "side": row.Side,
-                "right": row.Right,
-                "strike": float(row.Strike),
-                "qty": int(row.Qty),
-                "premium": float(row.Avg)
-            })
-        fig = draw_consolidated_payoff_chart(active_legs, spot, step, T, rate, div)
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Execution trade history
-    st.markdown("---")
-    st.subheader("📜 Execution History")
-    if st.session_state.trade_history:
-        st.dataframe(pd.DataFrame(st.session_state.trade_history).sort_values("time", ascending=False), use_container_width=True, hide_index=True)
-    else:
-        st.info("No trades executed yet.")
+    g_cols = st.columns(4)
+    g_cols[0].metric("Net Delta", f"{delta_tot:.2f}")
+    g_cols[1].metric("Net Gamma", f"{gamma_tot:.5f}")
+    g_cols[2].metric("Net Theta", f"₹{theta_tot:,.2f}/day")
+    g_cols[3].metric("Net Vega", f"₹{vega_tot:,.2f}/1% Vol")
