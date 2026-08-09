@@ -7,32 +7,38 @@ def format_breeze_date(date_obj, target_type):
     """
     Format standard Date/Datetime objects to match Breeze API specifications exactly:
     - ISO_HISTORICAL: "YYYY-MM-DDTHH:mm:ss.000Z" (Millisecond precision ISO 8601 UTC)
-    - ISO_EXPIRY: "YYYY-MM-DDTHH:mm:ss.000Z"
+    - ISO_EXPIRY: "YYYY-MM-DDT06:00:00.000Z" (Option contracts expiry)
     - FEED_EXCHANGE: "DD-MMM-YYYY" (Short exchange string)
     - DISPLAY_FORMAT: "DD-b-YYYY"
     """
     if isinstance(date_obj, str):
-        if "T" in date_obj and date_obj.endswith("Z"):
-            # Already a fully formatted ISO UTC string! Return exactly as-is!
-            return date_obj
-        try:
-            if "T" in date_obj:
-                date_obj = datetime.strptime(date_obj.split("T")[0], "%Y-%m-%d").date()
-            else:
-                date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
-        except Exception:
-            return date_obj
+        clean_str = date_obj.replace("Z", "")
+        if "T" in clean_str:
+            try:
+                date_obj = datetime.strptime(clean_str.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                try:
+                    date_obj = datetime.strptime(clean_str.split("T")[0], "%Y-%m-%d").date()
+                except Exception:
+                    pass
+        else:
+            try:
+                date_obj = datetime.strptime(clean_str, "%Y-%m-%d").date()
+            except Exception:
+                pass
 
     if target_type == "ISO_HISTORICAL" or target_type == "ISO_EXPIRY":
         if isinstance(date_obj, datetime):
+            if target_type == "ISO_EXPIRY":
+                return date_obj.replace(hour=6, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             return date_obj.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        else:
-            # Set default expiry time to 15:30:00 (market close) for options
-            t = time(15, 30) if target_type == "ISO_EXPIRY" else time(9, 15)
+        elif isinstance(date_obj, date):
+            t = time(6, 0) if target_type == "ISO_EXPIRY" else time(9, 15)
             return datetime.combine(date_obj, t).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        else:
+            return str(date_obj)
 
     elif target_type == "FEED_EXCHANGE":
-        # Month must be capitalized short English (e.g. "Jul")
         return date_obj.strftime("%d-%b-%Y")
 
     elif target_type == "DISPLAY_FORMAT":
@@ -51,6 +57,23 @@ class BreezeClient:
 
     @property
     def configured(self): return bool(self.api_key and self.secret_key)
+
+    def _check_response(self, r):
+        if r.status_code != 200:
+            r.raise_for_status()
+        try:
+            resp_json = r.json()
+            if isinstance(resp_json, dict):
+                status_val = resp_json.get("Status")
+                error_msg = str(resp_json.get("Error", ""))
+                if status_val == 401 or "Unauthorized" in error_msg:
+                    fake_resp = requests.Response()
+                    fake_resp.status_code = 401
+                    fake_resp._content = r.content
+                    raise requests.exceptions.HTTPError("401 Client Error: Unauthorized User from Breeze API", response=fake_resp)
+        except Exception as e:
+            if isinstance(e, requests.exceptions.HTTPError):
+                raise e
 
     def login_url(self):
         return f'https://api.icicidirect.com/apiuser/login?api_key={quote(self.api_key)}'
@@ -96,11 +119,7 @@ class BreezeClient:
         r = requests.get(self.HISTORICAL_URL, params=params,
                          headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
 
-        if r.status_code != 200 or not r.json().get('Success'):
-            # Fallback error logging to print exact mismatch params
-            print(f"Breeze API Query Failed: Params = {params}, Response = {r.text}")
-
-        r.raise_for_status()
+        self._check_response(r)
         return r.json().get('Success', [])
 
     def historical_index(self,stock_code,from_date,to_date,interval='1minute'):
@@ -119,7 +138,7 @@ class BreezeClient:
         }
         r = requests.get(self.HISTORICAL_URL, params=params,
                          headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
-        r.raise_for_status()
+        self._check_response(r)
         return r.json().get('Success', [])
 
     def get_option_chain_quotes(self, stock_code, expiry_date=None, right=None, strike_price=None):

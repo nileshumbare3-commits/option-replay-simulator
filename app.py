@@ -28,6 +28,8 @@ st.set_page_config(
 )
 
 # ----------------- SESSION STATE INITIALIZATION -----------------
+if "breeze_auth_error" not in st.session_state:
+    st.session_state.breeze_auth_error = False
 if "positions" not in st.session_state:
     st.session_state.positions = []
 if "cash" not in st.session_state:
@@ -275,8 +277,11 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
                 df["datetime_naive"] = df["datetime"].dt.tz_localize(None) if df["datetime"].dt.tz is not None else df["datetime"]
                 df["diff"] = (df["datetime_naive"] - target_dt).abs()
                 best_row = df.loc[df["diff"].idxmin()]
+                st.session_state.breeze_auth_error = False
                 return float(best_row["close"])
         except Exception as e:
+            if "401" in str(e) or "Unauthorized" in str(e):
+                st.session_state.breeze_auth_error = True
             print(f"Failed to fetch auto-spot price from Breeze: {e}. Using fallback.")
         return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
 
@@ -297,6 +302,10 @@ def adjust_replay_time(minutes_delta: int):
 # ----------------- STEP 4: TOP CONTROL BAR & PRICE SUMMARY LINE -----------------
 st.title("🛡️ StockMock Options Simulator")
 st.caption("Professional Full-Stack Options Trading Replay Dashboard")
+
+# Render a prominent error banner if Breeze API returns 401 Unauthorized
+if st.session_state.get("breeze_auth_error", False):
+    st.warning("⚠️ ICICI Direct Breeze API Query Failed: Unauthorized User (401). Please check your API Key, Secret Key, and paste a valid Redirect URL/session token. Falling back gracefully to Simulated Demo Mode to maintain interface functionality.")
 
 # Top Control Bar layout with exactly 16 columns for perfect alignment
 with st.container():
@@ -396,6 +405,20 @@ if not st.session_state.active_expiry_date or st.session_state.active_expiry_dat
 
 active_expiry = st.session_state.active_expiry_date
 
+# Pre-flight authorization check for Breeze API mode to prevent crashes and multi-thread logs spamming
+if mode == "Breeze":
+    session = st.session_state.get("session_token")
+    if session and is_real_session_token(session):
+        try:
+            start_iso = f"{st.session_state.replay_date.strftime('%Y-%m-%d')}T09:15:00.000Z"
+            end_iso = f"{st.session_state.replay_date.strftime('%Y-%m-%d')}T09:20:00.000Z"
+            get_index_hist(client.api_key, client.secret_key, session, symbol, start_iso, end_iso, "1minute")
+            st.session_state.breeze_auth_error = False
+        except Exception as ex:
+            if "401" in str(ex) or "Unauthorized" in str(ex):
+                st.session_state.breeze_auth_error = True
+                mode = "Demo"
+
 # Load the option chain automatically
 current_load_key = f"{symbol}_{mode}_{st.session_state.replay_date}_{st.session_state.replay_time}_{step}_{strike_count}_{active_expiry}"
 if st.session_state.get("last_load_key") != current_load_key:
@@ -426,7 +449,9 @@ if st.session_state.get("last_load_key") != current_load_key:
                         d0["strike"] = strike_val
                         d0["right"] = right_val
                         return d0
-                except Exception:
+                except Exception as ex:
+                    if "401" in str(ex) or "Unauthorized" in str(ex):
+                        st.session_state.breeze_auth_error = True
                     pass
                 return None
 
@@ -687,8 +712,7 @@ with panel_col1:
             st.session_state.expiry_page_start = min(len(expiry_options) - 3, st.session_state.expiry_page_start + 1)
             st.rerun()
 
-    # Summary Strip
-    strip_cols = st.columns(6)
+    # Summary Strip - Using Custom CSS-styled div cards for high-density, no-wrap, professional display
     straddle_prem = atm_call_ltp + atm_put_ltp
     call_oi_tot = view[view.Right == "CALL"]["OI"].sum()
     put_oi_tot = view[view.Right == "PUT"]["OI"].sum()
@@ -698,12 +722,35 @@ with panel_col1:
     if np.isnan(atm_iv) or not np.isfinite(atm_iv):
         atm_iv = 16.5
 
-    strip_cols[0].metric("ATM IV", f"{atm_iv:.1f}%")
-    atm_mode = strip_cols[1].radio("ATM Mode", ["Spot", "Fut", "Synth"], horizontal=True, label_visibility="collapsed")
-    strip_cols[2].metric("Straddle Prem", f"₹{straddle_prem:.2f}")
-    strip_cols[3].metric("PCR", f"{pcr:.2f}")
-    strip_cols[4].metric("Call/Put OI", f"{call_oi_tot/10000000:.1f}Cr / {put_oi_tot/10000000:.1f}Cr")
-    strip_cols[5].metric("Max Pain", f"₹{nearest_atm:,.0f}")
+    st.markdown(f"""
+    <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 15px; background-color: #f8f9fa; padding: 10px; border-radius: 8px; border: 1px solid #e9ecef;">
+        <div style="text-align: center;">
+            <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">ATM IV</div>
+            <div style="font-size: 1.0rem; font-weight: 700; color: #212529; margin-top: 2px;">{atm_iv:.1f}%</div>
+        </div>
+        <div style="text-align: center; display: flex; flex-direction: column; justify-content: center; align-items: center;">
+            <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px;">ATM Mode</div>
+            <div style="font-size: 0.85rem; font-weight: 700; color: #0d6efd; background-color: #e7f1ff; padding: 2px 8px; border-radius: 4px; border: 1px solid #b6d4fe;">Spot</div>
+        </div>
+        <div style="text-align: center;">
+            <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">Straddle Prem</div>
+            <div style="font-size: 1.0rem; font-weight: 700; color: #212529; margin-top: 2px;">₹{straddle_prem:.2f}</div>
+        </div>
+        <div style="text-align: center;">
+            <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">PCR</div>
+            <div style="font-size: 1.0rem; font-weight: 700; color: #212529; margin-top: 2px;">{pcr:.2f}</div>
+        </div>
+        <div style="text-align: center;">
+            <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">Call/Put OI</div>
+            <div style="font-size: 0.9rem; font-weight: 700; color: #212529; margin-top: 4px; white-space: nowrap;">{call_oi_tot/10000000:.1f}Cr / {put_oi_tot/10000000:.1f}Cr</div>
+        </div>
+        <div style="text-align: center;">
+            <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">Max Pain</div>
+            <div style="font-size: 1.0rem; font-weight: 700; color: #212529; margin-top: 2px;">₹{nearest_atm:,.0f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    atm_mode = "Spot"
 
     # Render Option Matrix Table (Call LTP (Delta), Call OI bar, Strike, Put OI bar, Put LTP (Delta))
     atm_grid = sorted(round(nearest_atm + (i - 10) * step, 2) for i in range(21))
@@ -965,7 +1012,7 @@ with panel_col1:
 
     html_elements.append("</tbody></table>")
     html_rendered = "\n".join(html_elements).replace("__SYMBOL__", symbol)
-    st.components.v1.html(html_rendered, height=550, scrolling=True)
+    st.iframe(html_rendered, height=550)
 
 # --- RIGHT PANEL: PAYOFF CHART & ANALYTICS ---
 with panel_col2:
