@@ -251,8 +251,8 @@ def draw_consolidated_payoff_chart(active_legs, spot, step, T, rate, div):
         name="Today's MTM (T+t)"
     ))
 
-    fig.add_vline(x=spot, line_dash="dot", line_color="#f97316", width=2, annotation_text="Spot", annotation_position="top left")
-    fig.add_hline(y=0, line_dash="solid", line_color="#475569", width=1)
+    fig.add_vline(x=spot, line_dash="dot", line_color="#f97316", line_width=2, annotation_text="Spot", annotation_position="top left")
+    fig.add_hline(y=0, line_dash="solid", line_color="#475569", line_width=1)
 
     fig.update_layout(
         title="Consolidated Strategy Payoff & Today's MTM Chart (StockMock Style)",
