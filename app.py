@@ -522,7 +522,10 @@ with st.container(border=True):
                 end_iso = f"{selected_day.strftime('%Y-%m-%d')}T15:30:00.000Z"
                 exp_iso = f"{expiry_date.strftime('%Y-%m-%d')}T07:00:00.000Z"
 
+                unauthorized = False
                 for k in strikes:
+                    if unauthorized:
+                        break
                     for right in ["call", "put"]:
                         try:
                             d0 = get_hist(
@@ -542,13 +545,21 @@ with st.container(border=True):
                                 d0["right"] = right
                                 frames.append(d0)
                         except Exception as ex:
-                            st.warning(f"{right.upper()} {k}: {ex}")
+                            if "401" in str(ex) or "Unauthorized" in str(ex) or "unauthorized" in str(ex).lower():
+                                unauthorized = True
+                                st.error("❌ **Breeze Session Unauthorized (401)**: Your session token is invalid or expired. Please click 'Connect/Login ICICI Direct' on the sidebar to get a new session token, or switch 'Data mode' to 'Demo'.")
+                                break
+                            else:
+                                st.warning(f"{right.upper()} {k}: {ex}")
 
                 chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 times = sorted(chain.datetime.dropna().unique()) if not chain.empty else []
 
                 if chain.empty:
-                    st.toast("⚠️ Breeze API returned empty chain for this contract date. Gracefully loading un-cached high-fidelity simulated Option Chain.", icon="💡")
+                    if unauthorized:
+                        st.info("💡 Gracefully loaded high-fidelity simulated Option Chain in **Demo mode** so you can continue simulating!")
+                    else:
+                        st.toast("⚠️ Breeze API returned empty chain for this contract date. Gracefully loading un-cached high-fidelity simulated Option Chain.", icon="💡")
                     chain, times = demo_chain(atm, step, strike_count, selected_day)
                     st.session_state["breeze_fallback_active"] = True
                 else:
