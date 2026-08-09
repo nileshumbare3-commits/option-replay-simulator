@@ -75,6 +75,25 @@ class BreezeClient:
             if isinstance(e, requests.exceptions.HTTPError):
                 raise e
 
+    def generate_session(self, api_secret=None, session_token=None):
+        """
+        Generates/updates Breeze API session keys.
+        """
+        if api_secret:
+            self.secret_key = api_secret
+        if session_token:
+            # Handle standard raw or redirect formats seamlessly
+            clean_token = session_token
+            if "api_session=" in session_token:
+                clean_token = session_token.split("api_session=")[1].split("&")[0]
+            try:
+                # If it's a redirect token, try exchanging it
+                self.session_token = self.exchange_api_session(clean_token)
+            except Exception:
+                # Direct assignment fallback if exchange fails or token is already exchanged
+                self.session_token = clean_token
+        return self.session_token
+
     def login_url(self):
         return f'https://api.icicidirect.com/apiuser/login?api_key={quote(self.api_key)}'
 

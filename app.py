@@ -103,6 +103,7 @@ client = BreezeClient(
     secret_key=st.session_state.breeze_secret_key,
     session_token=st.session_state.get("session_token")
 )
+breeze = client
 
 # Connect Oauth redirects dynamically
 api_session = None
@@ -169,6 +170,20 @@ if "action" in st.query_params:
 # ----------------- SIDEBAR: LOGIN & SETUP -----------------
 with st.sidebar:
     st.header("🔑 Breeze API Connection")
+
+    if st.session_state.get("breeze_auth_error", False):
+        st.sidebar.warning("⚠️ Breeze Session Expired. Please enter a new Session Token.")
+        new_token_val = st.sidebar.text_input("Breeze Session Token", type="password", key="sidebar_refresh_token_input")
+        if new_token_val:
+            try:
+                exchanged_token = breeze.generate_session(st.session_state.breeze_secret_key, new_token_val)
+                st.session_state["session_token"] = exchanged_token
+                st.session_state.breeze_auth_error = False
+                st.sidebar.success("Connected & Refreshed!")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Failed to refresh session: {e}")
+
     with st.expander("Configure API Keys", expanded=not (st.session_state.breeze_api_key and st.session_state.breeze_secret_key)):
         user_api_key = st.text_input("Breeze API Key", value=st.session_state.breeze_api_key)
         user_secret_key = st.text_input("Breeze Secret Key", value=st.session_state.breeze_secret_key, type="password")
@@ -254,7 +269,7 @@ def demo_chain(atm, step, count, day):
     return pd.DataFrame(rows), times
 
 def get_spot_price(client, symbol, selected_day, selected_time, mode):
-    if mode == "Demo":
+    if mode == "Demo" or st.session_state.get("breeze_auth_error", False):
         base_spot = 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
         day_variance = (selected_day.day * 15.0) - 200.0
         # Time progression variance
@@ -264,10 +279,14 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
     else:
         session = st.session_state.get("session_token")
         if not is_real_session_token(session):
-            return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
+            base_spot = 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
+            day_variance = (selected_day.day * 15.0) - 200.0
+            time_minutes = selected_time.hour * 60 + selected_time.minute - 555
+            time_variance = time_minutes * 0.15
+            return base_spot + day_variance + time_variance
         try:
-            start_iso = f"{selected_day}T09:15:00.000Z"
-            end_iso = f"{selected_day}T15:30:00.000Z"
+            start_iso = f"{selected_day.strftime('%Y-%m-%d')}T09:15:00.000Z"
+            end_iso = f"{selected_day.strftime('%Y-%m-%d')}T15:30:00.000Z"
             df = get_index_hist(client.api_key, client.secret_key, session, symbol, start_iso, end_iso, "1minute")
             if not df.empty and "close" in df and "datetime" in df:
                 df["datetime"] = pd.to_datetime(df["datetime"])
@@ -283,7 +302,17 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
             if "401" in str(e) or "Unauthorized" in str(e):
                 st.session_state.breeze_auth_error = True
             print(f"Failed to fetch auto-spot price from Breeze: {e}. Using fallback.")
-        return 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
+            base_spot = 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
+            day_variance = (selected_day.day * 15.0) - 200.0
+            time_minutes = selected_time.hour * 60 + selected_time.minute - 555
+            time_variance = time_minutes * 0.15
+            return base_spot + day_variance + time_variance
+        # Default safety fallback
+        base_spot = 25000.0 if symbol == "NIFTY" else (52000.0 if symbol == "BANKNIFTY" else 23000.0)
+        day_variance = (selected_day.day * 15.0) - 200.0
+        time_minutes = selected_time.hour * 60 + selected_time.minute - 555
+        time_variance = time_minutes * 0.15
+        return base_spot + day_variance + time_variance
 
 def adjust_replay_time(minutes_delta: int):
     current_dt = datetime.combine(st.session_state.replay_date, st.session_state.replay_time)

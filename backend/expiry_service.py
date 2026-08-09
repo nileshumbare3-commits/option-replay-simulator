@@ -95,21 +95,23 @@ def generate_mock_symbols_for_demo(underlying: str, atm_strike: float, step: flo
     for idx, exp_date in enumerate(exp_dates):
         yy = exp_date.strftime("%y")
         month_val = exp_date.month
-
-        # Last one formatted as monthly (e.g. 26AUG), first three as weekly (e.g. 26825)
         is_monthly = (idx == 3)
+
+        # Always generate weekly symbol format so the exact expiry date can be parsed cleanly
+        month_code = WEEKLY_MONTH_MAP_REV.get(month_val, str(month_val))
+        day_str = f"{exp_date.day:02d}"
 
         for strike in strikes:
             strike_str = str(int(strike))
             for right in ["CE", "PE"]:
+                sym_weekly = f"{underlying_upper}{yy}{month_code}{day_str}{strike_str}{right}"
+                symbols.append(sym_weekly)
+
+                # If it's a monthly expiry, we also generate the monthly symbol representation
                 if is_monthly:
                     month_str = MONTHLY_MAP_REV.get(month_val, "AUG")
-                    sym = f"{underlying_upper}{yy}{month_str}{strike_str}{right}"
-                else:
-                    month_code = WEEKLY_MONTH_MAP_REV.get(month_val, str(month_val))
-                    day_str = f"{exp_date.day:02d}"
-                    sym = f"{underlying_upper}{yy}{month_code}{day_str}{strike_str}{right}"
-                symbols.append(sym)
+                    sym_monthly = f"{underlying_upper}{yy}{month_str}{strike_str}{right}"
+                    symbols.append(sym_monthly)
     return symbols
 
 def get_dynamic_expiry_dates(symbol: str, atm_strike: float, step: float, replay_date: date, client=None) -> list:
