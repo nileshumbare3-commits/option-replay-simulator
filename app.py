@@ -9,7 +9,7 @@ from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
 from breeze_client import BreezeClient, format_breeze_date
 from greeks import implied_vol, greeks
-from backend.expiry_service import get_official_expiry_dates
+from backend.expiry_service import get_official_expiry_dates, format_contract_symbol, parse_expiry_from_contract
 
 load_dotenv()
 st.set_page_config(page_title="Breeze Option Replay", page_icon="📈", layout="wide")
@@ -1109,6 +1109,10 @@ with tab_terminal:
             l_row = view[(view.Strike==l["strike"])&(view.Right==l["right"])]
             premium = float(l_row.iloc[0].LTP) if not l_row.empty else l.get("premium", 0.0)
             l["premium"] = premium
+            try:
+                l["Symbol"] = format_contract_symbol(symbol, expiry_date, l["strike"], l["right"])
+            except Exception:
+                l["Symbol"] = ""
             draft_legs.append(l)
 
         st.markdown("**Strategy Draft Legs:**")
@@ -1166,7 +1170,12 @@ with tab_positions:
 
         for i, row in portfolio.iterrows():
             c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.5, 1, 1, 1, 1.2, 1, 1, 1])
-            c1.markdown(f"**{row.Side} {row.Right} {row.Strike:,.0f}**")
+            try:
+                pos_sym = format_contract_symbol(symbol, expiry_date, row.Strike, row.Right)
+                symbol_display = f" ({pos_sym})"
+            except Exception:
+                symbol_display = ""
+            c1.markdown(f"**{row.Side} {row.Right} {row.Strike:,.0f}**<br/><span style='font-size:0.75rem; color:#8b949e;'>{symbol_display}</span>", unsafe_allow_html=True)
 
             new_qty = c2.number_input("Qty", 25, 100000, int(row.Qty), step=25, key=f"qty_input_{row.id}")
             if new_qty != int(row.Qty):

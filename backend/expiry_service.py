@@ -2,6 +2,7 @@ import os
 import zipfile
 import requests
 import io
+import re
 import pandas as pd
 from datetime import date, datetime, timedelta
 
@@ -130,3 +131,98 @@ def filter_expiries_for_replay(selected_day: date, expiries: list) -> list:
     past = [d for d in sorted_all if d < selected_day][-20:]
     active_future = [d for d in sorted_all if d >= selected_day][:21]
     return sorted(past + active_future)
+
+
+# Month mapping for weekly option contracts
+WEEKLY_MONTH_MAP = {
+    '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6,
+    '7': 7, '8': 8, '9': 9, 'O': 10, 'N': 11, 'D': 12
+}
+
+MONTHLY_MAP = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+}
+
+def parse_expiry_from_contract(contract_symbol: str) -> date:
+    """
+    Parses expiry date from NSE / Breeze option contract symbol.
+    Examples:
+      - NIFTY26AUG24500CE  -> 2026-08-25 (or last Thursday/Tuesday of Aug 2026)
+      - NIFTY2682524500CE  -> 2026-08-25 (Weekly: 25th Aug 2026)
+      - BANKNIFTY26O1552000PE -> 2026-10-15 (Weekly: 15th Oct 2026)
+    """
+    symbol = contract_symbol.upper().strip()
+
+    # 1. Check for WEEKLY Expiry Format: [SYMBOL][YY][M/O/N/D][DD][STRIKE][CE/PE]
+    # Example: NIFTY2682524500CE -> YY=26, Month=8, Day=25
+    weekly_match = re.search(r'(\d{2})([1-9OND])(\d{2})\d+(CE|PE)$', symbol)
+    if weekly_match:
+        yy_str, month_code, day_str = weekly_match.groups()[:3]
+        year = 2000 + int(yy_str)
+        month = WEEKLY_MONTH_MAP[month_code]
+        day = int(day_str)
+        return datetime(year, month, day).date()
+
+    # 2. Check for MONTHLY Expiry Format: [SYMBOL][YY][MMM][STRIKE][CE/PE]
+    # Example: NIFTY26AUG24500CE -> YY=26, Month=AUG
+    monthly_match = re.search(r'(\d{2})([A-Z]{3})\d+(CE|PE)$', symbol)
+    if monthly_match:
+        yy_str, month_str = monthly_match.groups()[:2]
+        year = 2000 + int(yy_str)
+        month = MONTHLY_MAP.get(month_str)
+
+        if month:
+            # Derive the monthly expiry day (Last Thursday or Tuesday of the month)
+            return get_last_expiry_day_of_month(year, month)
+
+    raise ValueError(f"Unable to parse expiry date from symbol: {contract_symbol}")
+
+
+def get_last_expiry_day_of_month(year: int, month: int) -> date:
+    """
+    Calculates the last trading expiry day of a given month.
+    NSE Expiry Shift:
+      - Before Sept 2025: Last Thursday (weekday = 3)
+      - Sept 2025 onwards: Last Tuesday (weekday = 1)
+    """
+    import calendar
+
+    # Determine weekday target (Thursday = 3, Tuesday = 1)
+    target_weekday = 1 if (year > 2025 or (year == 2025 and month >= 9)) else 3
+
+    # Get total days in month
+    _, last_day = calendar.monthrange(year, month)
+    last_date = datetime(year, month, last_day).date()
+
+    # Roll back to the last target weekday of the month
+    while last_date.weekday() != target_weekday:
+        last_date -= timedelta(days=1)
+
+    return last_date
+
+
+def format_contract_symbol(underlying_symbol: str, expiry_date_val: date, strike: float, right: str) -> str:
+    """
+    Encodes an option contract into standardized NSE/Breeze symbol format.
+    Determines whether the expiry is weekly or monthly and formats accordingly.
+    """
+    yy = expiry_date_val.strftime("%y") # e.g. "26"
+    strike_str = str(int(float(strike)))
+    right_upper = right.upper()
+    right_code = "CE" if right_upper in ["CALL", "CE"] else "PE"
+
+    # Determine if monthly: check if expiry_date is the last target weekday of the month
+    last_exp = get_last_expiry_day_of_month(expiry_date_val.year, expiry_date_val.month)
+    is_monthly = (expiry_date_val == last_exp)
+
+    if is_monthly:
+        month_str = expiry_date_val.strftime("%b").upper() # e.g. "AUG"
+        return f"{underlying_symbol.upper()}{yy}{month_str}{strike_str}{right_code}"
+    else:
+        month_val = expiry_date_val.month
+        # Month mapping for weekly
+        inv_map = {v: k for k, v in WEEKLY_MONTH_MAP.items()}
+        m_code = inv_map.get(month_val, str(month_val))
+        dd_str = f"{expiry_date_val.day:02d}"
+        return f"{underlying_symbol.upper()}{yy}{m_code}{dd_str}{strike_str}{right_code}"
