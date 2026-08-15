@@ -290,11 +290,13 @@ def get_spot_price(client, symbol, selected_day, selected_time, mode):
             end_iso = f"{selected_day.strftime('%Y-%m-%d')}T15:30:00.000Z"
             df = get_index_hist(client.api_key, client.secret_key, session, symbol, start_iso, end_iso, "1minute")
             if not df.empty and "close" in df and "datetime" in df:
-                df["datetime"] = pd.to_datetime(df["datetime"])
+                dt_series = pd.to_datetime(df["datetime"])
+                if dt_series.dt.tz is not None:
+                    dt_series = dt_series.dt.tz_localize(None)
                 target_dt = pd.Timestamp(datetime.combine(selected_day, selected_time))
-                if target_dt.tzinfo is not None:
+                if target_dt.tzinfo is not None or getattr(target_dt, "tz", None) is not None:
                     target_dt = target_dt.tz_localize(None)
-                df["datetime_naive"] = df["datetime"].dt.tz_localize(None) if df["datetime"].dt.tz is not None else df["datetime"]
+                df["datetime_naive"] = dt_series
                 df["diff"] = (df["datetime_naive"] - target_dt).abs()
                 best_row = df.loc[df["diff"].idxmin()]
                 st.session_state.breeze_auth_error = False

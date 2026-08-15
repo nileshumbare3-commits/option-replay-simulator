@@ -26,3 +26,6 @@ TypeError: IframeMixin.iframe() got an unexpected keyword argument 'srcdoc'
 2026-08-15 10:47:26.998 Please replace `st.components.v1.html` with `st.iframe`.
 
 `st.components.v1.html` will be removed after 2026-06-01.
+2026-08-15 11:49:34.264 Please replace `st.components.v1.html` with `st.iframe`.
+
+`st.components.v1.html` will be removed after 2026-06-01.
