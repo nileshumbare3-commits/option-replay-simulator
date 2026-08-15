@@ -145,7 +145,7 @@ def test_parse_expiry_from_symbol_name_weekly():
 
 def test_parse_expiry_from_symbol_name_monthly():
     d = parse_expiry_from_symbol_name("NIFTY26AUG24500CE")
-    assert d == date(2026, 8, 31)
+    assert d == date(2026, 8, 25)
 
 def test_generate_mock_symbols_for_demo():
     symbols = generate_mock_symbols_for_demo("NIFTY", 24000, 50, date(2026, 8, 1))
