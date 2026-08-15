@@ -76,7 +76,7 @@ def normalize_date(val) -> date:
 def parse_expiry_from_symbol(symbol: str) -> Optional[str]:
     """
     Parses contract symbol strings like 'NIFTY11AUG2624000CE' -> '2026-08-11'
-    or 'NIFTY26AUG24500CE' -> '2026-08-31' or 'NIFTY2681124000CE' -> '2026-08-11'.
+    or 'NIFTY26AUG24500CE' -> '2026-08-27' or 'NIFTY2681124000CE' -> '2026-08-11'.
     """
     if not symbol or not isinstance(symbol, str):
         return None
@@ -95,10 +95,15 @@ def parse_expiry_from_symbol(symbol: str) -> Optional[str]:
                 if 1 <= day <= 31:
                     return f"{year:04d}-{month:02d}-{day:02d}"
             else:
-                # Format B: YY + MMM + STRIKE (e.g. 26 + AUG + 24500)
+                # Monthly contract without embedded day: YY + MMM + STRIKE (e.g. 26 + AUG + 24500)
                 year = 2000 + int(prefix_digits)
+                target_weekday = 1 if (year > 2025 or (year == 2025 and month >= 9)) else 3
                 _, last_day = calendar.monthrange(year, month)
-                return f"{year:04d}-{month:02d}-{last_day:02d}"
+                dt = date(year, month, last_day)
+                while dt.weekday() != target_weekday:
+                    dt -= timedelta(days=1)
+                dt = adjust_for_holiday(dt)
+                return dt.isoformat()
 
     # 2. Compact weekly format: NIFTY2681124000CE (26=year, 8=month, 11=day)
     weekly_match = re.search(r'(\d{2})([1-9OND])(\d{2})\d+(CE|PE)$', symbol_str)
