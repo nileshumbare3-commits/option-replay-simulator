@@ -2,11 +2,15 @@ import json, os, logging, urllib.parse
 from datetime import date, time, datetime
 from typing import Optional
 import requests
-import pyotp
 
 logger = logging.getLogger(__name__)
 
-# Selenium imports for session automation
+# Optional dependencies for session automation
+try:
+    import pyotp
+except ImportError:
+    pyotp = None
+
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -21,8 +25,8 @@ def generate_breeze_session_token(api_key: str, username: str, password: str, to
     Automates login to ICICI Direct Breeze portal using Selenium and pyotp.
     Returns fresh API_Session token valid for 24 hours.
     """
-    if not webdriver:
-        logger.error("Selenium is not installed.")
+    if not webdriver or not pyotp:
+        logger.warning("Selenium or pyotp is not installed. Automated token generation disabled.")
         return None
 
     chrome_options = Options()
@@ -100,7 +104,7 @@ def fetch_simulation_spot_price(
             return float(res[-1].get("close", fallback_spot))
 
     except Exception as e:
-        logger.warning(f"Breeze Session 401/API Error: {e}. Switching to fallback spot price.")
+        logger.warning(f"Breeze Session 401/API Warning: {e}. Switching to fallback spot price {fallback_spot}.")
 
     return fallback_spot
 
@@ -164,7 +168,6 @@ class BreezeClient:
                     fake_resp = requests.Response()
                     fake_resp.status_code = 401
                     fake_resp._content = r.content
-                    logger.warning("Breeze API returned 401 Unauthorized status.")
                     raise requests.exceptions.HTTPError("401 Client Error: Unauthorized User from Breeze API", response=fake_resp)
         except Exception as e:
             if isinstance(e, requests.exceptions.HTTPError):
@@ -216,23 +219,10 @@ class BreezeClient:
             'strike_price': f_strike
         }
 
-        try:
-            r = requests.get(self.HISTORICAL_URL, params=params,
-                             headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
-            self._check_response(r)
-            return r.json().get('Success', [])
-        except requests.exceptions.HTTPError as http_err:
-            if "401" in str(http_err):
-                logger.warning("Breeze Session Expired (401 Unauthorized) while fetching historical option.")
-                try:
-                    r = requests.get(self.HISTORICAL_URL, params=params,
-                                     headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
-                    self._check_response(r)
-                    return r.json().get('Success', [])
-                except Exception as ex:
-                    logger.error(f"Retry failed for historical option: {ex}")
-                    raise http_err
-            raise http_err
+        r = requests.get(self.HISTORICAL_URL, params=params,
+                         headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
+        self._check_response(r)
+        return r.json().get('Success', [])
 
     def historical_index(self,stock_code,from_date,to_date,interval='1minute'):
         if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
@@ -249,23 +239,10 @@ class BreezeClient:
             'product_type': 'cash'
         }
 
-        try:
-            r = requests.get(self.HISTORICAL_URL, params=params,
-                             headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
-            self._check_response(r)
-            return r.json().get('Success', [])
-        except requests.exceptions.HTTPError as http_err:
-            if "401" in str(http_err):
-                logger.warning("Breeze Session Expired (401 Unauthorized) while fetching historical index spot price.")
-                try:
-                    r = requests.get(self.HISTORICAL_URL, params=params,
-                                     headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
-                    self._check_response(r)
-                    return r.json().get('Success', [])
-                except Exception as ex:
-                    logger.error(f"Retry failed for historical index spot price: {ex}")
-                    raise http_err
-            raise http_err
+        r = requests.get(self.HISTORICAL_URL, params=params,
+                         headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
+        self._check_response(r)
+        return r.json().get('Success', [])
 
     def get_option_chain_quotes(self, stock_code, expiry_date=None, right=None, strike_price=None):
         if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
