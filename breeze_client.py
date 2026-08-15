@@ -1,7 +1,9 @@
-import json, os
+import json, os, logging
 from urllib.parse import quote
 from datetime import date, time, datetime
 import requests
+
+logger = logging.getLogger(__name__)
 
 def format_breeze_date(date_obj, target_type):
     """
@@ -70,10 +72,27 @@ class BreezeClient:
                     fake_resp = requests.Response()
                     fake_resp.status_code = 401
                     fake_resp._content = r.content
+                    logger.warning("Breeze API returned 401 Unauthorized status.")
                     raise requests.exceptions.HTTPError("401 Client Error: Unauthorized User from Breeze API", response=fake_resp)
         except Exception as e:
             if isinstance(e, requests.exceptions.HTTPError):
                 raise e
+
+    def generate_session(self, api_secret=None, session_token=None):
+        """
+        Generates/updates Breeze API session keys.
+        """
+        if api_secret:
+            self.secret_key = api_secret
+        if session_token:
+            clean_token = session_token
+            if "api_session=" in session_token:
+                clean_token = session_token.split("api_session=")[1].split("&")[0]
+            try:
+                self.session_token = self.exchange_api_session(clean_token)
+            except Exception:
+                self.session_token = clean_token
+        return self.session_token
 
     def login_url(self):
         return f'https://api.icicidirect.com/apiuser/login?api_key={quote(self.api_key)}'
@@ -89,15 +108,10 @@ class BreezeClient:
 
     def historical_option(self,stock_code,from_date,to_date,expiry_date,right,strike_price,interval='1minute'):
         """
-        Historical option REST endpoint.
-        - from_date & to_date must be "YYYY-MM-DDTHH:mm:ss.000Z"
-        - expiry_date must be "YYYY-MM-DDTHH:mm:ss.000Z"
-        - strike_price is integer string (e.g. "24500")
-        - right is strictly lowercase ("call" or "put")
+        Historical option REST endpoint with 401 retry handling.
         """
         if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
 
-        # Format string sanitation according to the guidelines
         f_from = format_breeze_date(from_date, "ISO_HISTORICAL")
         f_to = format_breeze_date(to_date, "ISO_HISTORICAL")
         f_exp = format_breeze_date(expiry_date, "ISO_EXPIRY")
@@ -116,13 +130,29 @@ class BreezeClient:
             'strike_price': f_strike
         }
 
-        r = requests.get(self.HISTORICAL_URL, params=params,
-                         headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
-
-        self._check_response(r)
-        return r.json().get('Success', [])
+        try:
+            r = requests.get(self.HISTORICAL_URL, params=params,
+                             headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
+            self._check_response(r)
+            return r.json().get('Success', [])
+        except requests.exceptions.HTTPError as http_err:
+            if "401" in str(http_err):
+                logger.warning("Breeze Session Expired (401 Unauthorized) while fetching historical option. Attempting retry...")
+                # Retry once if token is set
+                try:
+                    r = requests.get(self.HISTORICAL_URL, params=params,
+                                     headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
+                    self._check_response(r)
+                    return r.json().get('Success', [])
+                except Exception as ex:
+                    logger.error(f"Retry failed for historical option: {ex}")
+                    raise http_err
+            raise http_err
 
     def historical_index(self,stock_code,from_date,to_date,interval='1minute'):
+        """
+        Fetches historical index spot data with exact parameter formatting and 401 retry interception.
+        """
         if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
 
         f_from = format_breeze_date(from_date, "ISO_HISTORICAL")
@@ -136,15 +166,27 @@ class BreezeClient:
             'exchange_code': 'NSE',
             'product_type': 'cash'
         }
-        r = requests.get(self.HISTORICAL_URL, params=params,
-                         headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
-        self._check_response(r)
-        return r.json().get('Success', [])
+
+        try:
+            r = requests.get(self.HISTORICAL_URL, params=params,
+                             headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
+            self._check_response(r)
+            return r.json().get('Success', [])
+        except requests.exceptions.HTTPError as http_err:
+            if "401" in str(http_err):
+                logger.warning("Breeze Session Expired (401 Unauthorized) while fetching historical index spot price.")
+                # Retry once
+                try:
+                    r = requests.get(self.HISTORICAL_URL, params=params,
+                                     headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
+                    self._check_response(r)
+                    return r.json().get('Success', [])
+                except Exception as ex:
+                    logger.error(f"Retry failed for historical index spot price: {ex}")
+                    raise http_err
+            raise http_err
 
     def get_option_chain_quotes(self, stock_code, expiry_date=None, right=None, strike_price=None):
-        """
-        Retrieves real available contract expiries & details from Breeze Security master / active quotes.
-        """
         if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
 
         params = {
@@ -159,7 +201,6 @@ class BreezeClient:
         if strike_price:
             params['strike_price'] = str(int(float(strike_price)))
 
-        # In real Breeze, this URL is option chain quotes endpoint
         url = 'https://breezeapi.icicidirect.com/api/v2/optionchain'
         try:
             r = requests.get(url, params=params, headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)

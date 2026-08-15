@@ -6,6 +6,7 @@ import numpy as np
 import math
 
 from backend.breeze_service import BreezeService
+from backend.expiry_service import process_historical_contracts_payload
 from backend.math_engine import (
     black_scholes_pricing,
     implied_volatility,
@@ -288,6 +289,17 @@ def get_option_chain(req: OptionChainRequest):
         },
         "chain": chain_rows
     }
+
+@app.post("/api/option-chain/process")
+def process_option_chain_contracts(payload: Dict[str, Any]):
+    """
+    Parses historical contract metadata, resolves limit expiries, handles roll-overs/expirations,
+    and returns the filtered option chain payload per the exact specification.
+    """
+    try:
+        return process_historical_contracts_payload(payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/positions")
 def get_positions():
