@@ -428,7 +428,10 @@ auto_spot = get_spot_price(client, symbol, st.session_state.replay_date, st.sess
 nearest_atm = round(round(auto_spot / step) * step, 2)
 
 # Dynamic expiry fetching (No legacy weekday offsets or Tuesday/Thursday shift rules!)
-expiry_options = get_dynamic_expiry_dates(symbol, nearest_atm, step, st.session_state.replay_date, client)
+expiry_options = get_dynamic_expiry_dates(
+    symbol, nearest_atm, step, st.session_state.replay_date, client,
+    historical_contracts=st.session_state.get("historical_contracts")
+)
 
 if not st.session_state.active_expiry_date or st.session_state.active_expiry_date not in expiry_options:
     st.session_state.active_expiry_date = expiry_options[0]
@@ -1042,7 +1045,7 @@ with panel_col1:
 
     html_elements.append("</tbody></table>")
     html_rendered = "\n".join(html_elements).replace("__SYMBOL__", symbol)
-    st.iframe(html_rendered, height=550)
+    st.components.v1.html(html_rendered, height=550)
 
 # --- RIGHT PANEL: PAYOFF CHART & ANALYTICS ---
 with panel_col2:
