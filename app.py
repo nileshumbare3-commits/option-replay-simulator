@@ -13,7 +13,8 @@ from greeks import implied_vol, greeks
 from backend.expiry_service import (
     get_dynamic_expiry_dates,
     format_contract_symbol,
-    parse_expiry_from_symbol_name
+    parse_expiry_from_symbol_name,
+    process_historical_contracts_payload
 )
 
 # Load environment variables
