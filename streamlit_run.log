@@ -12,3 +12,4 @@ Collecting usage statistics. To deactivate, set browser.gatherUsageStats to fals
 2026-08-15 08:36:24.739 Please replace `st.components.v1.html` with `st.iframe`.
 
 `st.components.v1.html` will be removed after 2026-06-01.
+  Stopping...

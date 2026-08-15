@@ -1,18 +1,110 @@
-import json, os, logging
-from urllib.parse import quote
+import json, os, logging, urllib.parse
 from datetime import date, time, datetime
+from typing import Optional
 import requests
+import pyotp
 
 logger = logging.getLogger(__name__)
 
+# Selenium imports for session automation
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+except ImportError:
+    webdriver = None
+
+def generate_breeze_session_token(api_key: str, username: str, password: str, totp_secret: str) -> Optional[str]:
+    """
+    Automates login to ICICI Direct Breeze portal using Selenium and pyotp.
+    Returns fresh API_Session token valid for 24 hours.
+    """
+    if not webdriver:
+        logger.error("Selenium is not installed.")
+        return None
+
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+
+    driver = None
+    session_token = None
+
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        login_url = f"https://api.icicidirect.com/apiuser/login?api_key={urllib.parse.quote(api_key)}"
+        driver.get(login_url)
+        wait = WebDriverWait(driver, 15)
+
+        # 1. Input Credentials
+        user_field = wait.until(EC.presence_of_element_located((By.ID, "txtUserId")))
+        pass_field = driver.find_element(By.ID, "txtPassword")
+
+        user_field.send_keys(username)
+        pass_field.send_keys(password)
+        driver.find_element(By.ID, "btnLogin").click()
+
+        # 2. Enter TOTP / 2FA Code
+        totp = pyotp.TOTP(totp_secret)
+        otp_field = wait.until(EC.presence_of_element_located((By.ID, "txtOtp")))
+        otp_field.send_keys(totp.now())
+        driver.find_element(By.ID, "btnSubmitOtp").click()
+
+        # 3. Extract API_Session from redirected URL parameter
+        wait.until(EC.url_contains("API_Session="))
+        current_url = driver.current_url
+        parsed_url = urllib.parse.urlparse(current_url)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+
+        session_token = query_params.get("API_Session", [None])[0]
+        logger.info(f"Breeze Session Token generated successfully: {session_token}")
+
+    except Exception as e:
+        logger.error(f"Failed to generate Breeze session via Selenium: {e}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    return session_token
+
+def fetch_simulation_spot_price(
+    breeze_client,
+    stock_code: str,
+    simulation_date: str,
+    fallback_spot: float = 24000.0
+) -> float:
+    """
+    Attempts to fetch spot price from Breeze historical charts.
+    Falls back gracefully on 401 Unauthorized or API failure.
+    """
+    if not breeze_client or not getattr(breeze_client, "session_token", None):
+        logger.info(f"Breeze client inactive. Using fallback spot: {fallback_spot}")
+        return fallback_spot
+
+    try:
+        from_time = f"{simulation_date}T09:15:00.000Z"
+        to_time = f"{simulation_date}T15:30:00.000Z"
+
+        res = breeze_client.historical_index(
+            stock_code=stock_code,
+            from_date=from_time,
+            to_date=to_time
+        )
+        if res and isinstance(res, list) and len(res) > 0:
+            return float(res[-1].get("close", fallback_spot))
+
+    except Exception as e:
+        logger.warning(f"Breeze Session 401/API Error: {e}. Switching to fallback spot price.")
+
+    return fallback_spot
+
 def format_breeze_date(date_obj, target_type):
-    """
-    Format standard Date/Datetime objects to match Breeze API specifications exactly:
-    - ISO_HISTORICAL: "YYYY-MM-DDTHH:mm:ss.000Z" (Millisecond precision ISO 8601 UTC)
-    - ISO_EXPIRY: "YYYY-MM-DDT06:00:00.000Z" (Option contracts expiry)
-    - FEED_EXCHANGE: "DD-MMM-YYYY" (Short exchange string)
-    - DISPLAY_FORMAT: "DD-b-YYYY"
-    """
     if isinstance(date_obj, str):
         clean_str = date_obj.replace("Z", "")
         if "T" in clean_str:
@@ -79,9 +171,6 @@ class BreezeClient:
                 raise e
 
     def generate_session(self, api_secret=None, session_token=None):
-        """
-        Generates/updates Breeze API session keys.
-        """
         if api_secret:
             self.secret_key = api_secret
         if session_token:
@@ -95,7 +184,7 @@ class BreezeClient:
         return self.session_token
 
     def login_url(self):
-        return f'https://api.icicidirect.com/apiuser/login?api_key={quote(self.api_key)}'
+        return f'https://api.icicidirect.com/apiuser/login?api_key={urllib.parse.quote(self.api_key or "")}'
 
     def exchange_api_session(self,api_session):
         payload=json.dumps({'SessionToken':api_session,'AppKey':self.api_key})
@@ -107,9 +196,6 @@ class BreezeClient:
         return token
 
     def historical_option(self,stock_code,from_date,to_date,expiry_date,right,strike_price,interval='1minute'):
-        """
-        Historical option REST endpoint with 401 retry handling.
-        """
         if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
 
         f_from = format_breeze_date(from_date, "ISO_HISTORICAL")
@@ -137,8 +223,7 @@ class BreezeClient:
             return r.json().get('Success', [])
         except requests.exceptions.HTTPError as http_err:
             if "401" in str(http_err):
-                logger.warning("Breeze Session Expired (401 Unauthorized) while fetching historical option. Attempting retry...")
-                # Retry once if token is set
+                logger.warning("Breeze Session Expired (401 Unauthorized) while fetching historical option.")
                 try:
                     r = requests.get(self.HISTORICAL_URL, params=params,
                                      headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
@@ -150,9 +235,6 @@ class BreezeClient:
             raise http_err
 
     def historical_index(self,stock_code,from_date,to_date,interval='1minute'):
-        """
-        Fetches historical index spot data with exact parameter formatting and 401 retry interception.
-        """
         if not self.api_key or not self.session_token: raise RuntimeError('Complete Breeze login first')
 
         f_from = format_breeze_date(from_date, "ISO_HISTORICAL")
@@ -175,7 +257,6 @@ class BreezeClient:
         except requests.exceptions.HTTPError as http_err:
             if "401" in str(http_err):
                 logger.warning("Breeze Session Expired (401 Unauthorized) while fetching historical index spot price.")
-                # Retry once
                 try:
                     r = requests.get(self.HISTORICAL_URL, params=params,
                                      headers={'X-SessionToken': self.session_token, 'X-apikey': self.api_key}, timeout=30)
