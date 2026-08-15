@@ -1,11 +1,14 @@
 import pytest
+import pandas as pd
 from datetime import date
 from backend.expiry_service import (
+    parse_expiry_from_symbol,
     parse_expiry_from_symbol_name,
     generate_mock_symbols_for_demo,
     get_dynamic_expiry_dates,
     format_contract_symbol,
     process_historical_contracts_payload,
+    get_expiry_and_option_chain,
     normalize_date,
     adjust_for_holiday,
     is_exchange_holiday
@@ -17,12 +20,55 @@ def test_normalize_date():
     assert normalize_date(date(2026, 8, 27)) == date(2026, 8, 27)
 
 def test_holiday_adjustment():
-    # Aug 15, 2026 is Independence Day (exchange holiday)
     aug_15 = date(2026, 8, 15)
     assert is_exchange_holiday(aug_15) is True
     adj = adjust_for_holiday(aug_15)
     assert adj < aug_15
     assert is_exchange_holiday(adj) is False
+
+def test_parse_expiry_from_symbol():
+    assert parse_expiry_from_symbol("NIFTY11AUG2624000CE") == "2026-08-11"
+    assert parse_expiry_from_symbol("NIFTY2681124000CE") == "2026-08-11"
+
+def test_get_expiry_and_option_chain():
+    contracts_df = pd.DataFrame([
+        {
+            "underlying": "NIFTY",
+            "contract_name": "NIFTY11AUG2624000CE",
+            "strike": 24000,
+            "option_type": "CE",
+            "ltp": 150.0,
+            "oi": 1000,
+            "iv": 15.0
+        },
+        {
+            "underlying": "NIFTY",
+            "contract_name": "NIFTY11AUG2624000PE",
+            "strike": 24000,
+            "option_type": "PE",
+            "ltp": 120.0,
+            "oi": 800,
+            "iv": 16.0
+        },
+        {
+            "underlying": "NIFTY",
+            "contract_name": "NIFTY18AUG2624000CE",
+            "strike": 24000,
+            "option_type": "CE",
+            "ltp": 200.0,
+            "oi": 500,
+            "iv": 17.0
+        }
+    ])
+
+    exp_str, chain_df = get_expiry_and_option_chain(contracts_df, "NIFTY", 24000.0, "2026-08-10")
+    assert exp_str == "2026-08-11"
+    assert len(chain_df) == 1
+    assert "CE_LTP" in chain_df.columns
+    assert "PE_LTP" in chain_df.columns
+    assert chain_df.iloc[0]["strike"] == 24000
+    assert chain_df.iloc[0]["CE_LTP"] == 150.0
+    assert chain_df.iloc[0]["PE_LTP"] == 120.0
 
 def test_process_historical_contracts_payload_exact_spec():
     payload = {
@@ -76,7 +122,7 @@ def test_process_historical_contracts_payload_exact_spec():
 def test_process_historical_contracts_payload_expired_rollover():
     payload = {
       "underlying": "NIFTY",
-      "request_date": "2026-09-01", # After August contract
+      "request_date": "2026-09-01",
       "historical_contracts": [
         {
           "symbol": "NIFTY26AUG24000CE",

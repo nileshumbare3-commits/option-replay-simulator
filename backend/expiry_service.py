@@ -1,5 +1,7 @@
 import re
 import calendar
+import pandas as pd
+from typing import Tuple, Optional
 from datetime import date, datetime, timedelta, timezone
 
 # Common Indian Exchange Fixed Holidays (Month, Day)
@@ -71,48 +73,105 @@ def normalize_date(val) -> date:
 
     raise ValueError(f"Unable to normalize date value: {val}")
 
-def parse_expiry_from_symbol_name(symbol_name: str, sibling_weekly_dates=None) -> date:
+def parse_expiry_from_symbol(symbol: str) -> Optional[str]:
     """
-    Extract the expiry date directly from contract symbol format:
-    - Weekly Format: NIFTY2682524500CE -> Extract 26 (Year 2026), 8 (Month Aug), 25 (Day 25) -> 2026-08-25
-    - Monthly Format: NIFTY26AUG24500CE -> Extract 26 (Year 2026), AUG (Month 08).
+    Parses contract symbol strings like 'NIFTY11AUG2624000CE' -> '2026-08-11'
+    or 'NIFTY26AUG24500CE' -> '2026-08-31' or 'NIFTY2681124000CE' -> '2026-08-11'.
     """
-    symbol = symbol_name.upper().strip()
+    if not symbol or not isinstance(symbol, str):
+        return None
+    symbol_str = symbol.upper().strip()
 
-    # 1. Weekly Format Example: [SYMBOL][YY][M/O/N/D][DD][STRIKE][CE/PE]
-    weekly_match = re.search(r'(\d{2})([1-9OND])(\d{2})\d+(CE|PE)$', symbol)
+    # 1. Check for 3-letter month format (AUG, SEP, etc.)
+    match_mmm = re.search(r'(\d{2})([A-Z]{3})(\d+)(CE|PE)$', symbol_str)
+    if match_mmm:
+        prefix_digits, month_str, suffix_digits, _ = match_mmm.groups()
+        if month_str in MONTHLY_MAP:
+            month = MONTHLY_MAP[month_str]
+            # If suffix_digits has >= 6 digits, e.g. '2624000' (2 digit year + 4-5 digit strike)
+            if len(suffix_digits) >= 6:
+                day = int(prefix_digits)
+                year = 2000 + int(suffix_digits[:2])
+                if 1 <= day <= 31:
+                    return f"{year:04d}-{month:02d}-{day:02d}"
+            else:
+                # Format B: YY + MMM + STRIKE (e.g. 26 + AUG + 24500)
+                year = 2000 + int(prefix_digits)
+                _, last_day = calendar.monthrange(year, month)
+                return f"{year:04d}-{month:02d}-{last_day:02d}"
+
+    # 2. Compact weekly format: NIFTY2681124000CE (26=year, 8=month, 11=day)
+    weekly_match = re.search(r'(\d{2})([1-9OND])(\d{2})\d+(CE|PE)$', symbol_str)
     if weekly_match:
         yy_str, month_code, day_str = weekly_match.groups()[:3]
         year = 2000 + int(yy_str)
         month = WEEKLY_MONTH_MAP[month_code]
         day = int(day_str)
-        return adjust_for_holiday(date(year, month, day))
+        return f"{year:04d}-{month:02d}-{day:02d}"
 
-    # 2. Monthly Format Example: [SYMBOL][YY][MMM][STRIKE][CE/PE]
-    monthly_match = re.search(r'(\d{2})([A-Z]{3})\d+(CE|PE)$', symbol)
-    if monthly_match:
-        yy_str, month_str = monthly_match.groups()[:2]
-        year = 2000 + int(yy_str)
-        month = MONTHLY_MAP.get(month_str)
-        if month:
-            if sibling_weekly_dates:
-                siblings = [d for d in sibling_weekly_dates if d.year == year and d.month == month]
-                if siblings:
-                    return max(siblings)
-            _, last_day = calendar.monthrange(year, month)
-            return adjust_for_holiday(date(year, month, last_day))
+    return None
 
+def parse_expiry_from_symbol_name(symbol_name: str, sibling_weekly_dates=None) -> date:
+    parsed_str = parse_expiry_from_symbol(symbol_name)
+    if parsed_str:
+        return adjust_for_holiday(datetime.strptime(parsed_str, "%Y-%m-%d").date())
     raise ValueError(f"Unable to parse expiry date from symbol: {symbol_name}")
 
 def parse_expiry_from_contract(contract_symbol: str) -> date:
     return parse_expiry_from_symbol_name(contract_symbol)
 
+def get_expiry_and_option_chain(
+    contracts_df: pd.DataFrame,
+    underlying: str,
+    spot_price: float,
+    simulation_date: str
+) -> Tuple[str, pd.DataFrame]:
+    """
+    Finds nearest strike to spot price, extracts matching expiry (e.g., Aug 11 vs Aug 14),
+    and filters the option chain accordingly.
+    """
+    df = contracts_df.copy()
+
+    if 'expiry_date' not in df.columns or df['expiry_date'].isnull().any():
+        col_target = 'contract_name' if 'contract_name' in df.columns else 'symbol'
+        if col_target in df.columns:
+            df['expiry_date'] = df[col_target].apply(parse_expiry_from_symbol)
+
+    df['expiry_dt'] = pd.to_datetime(df['expiry_date'])
+    sim_dt = pd.to_datetime(simulation_date)
+
+    valid_contracts = df[
+        (df['underlying'].str.upper() == underlying.upper()) &
+        (df['expiry_dt'] >= sim_dt)
+    ].copy()
+
+    if valid_contracts.empty:
+        raise ValueError(f"No contract master data found for {underlying} on/after {simulation_date}")
+
+    valid_contracts['strike_distance'] = (valid_contracts['strike'] - spot_price).abs()
+    nearest_contract = valid_contracts.sort_values(by=['strike_distance', 'expiry_dt']).iloc[0]
+
+    extracted_expiry_dt = nearest_contract['expiry_dt']
+    extracted_expiry_str = extracted_expiry_dt.strftime("%Y-%m-%d")
+
+    chain_contracts = df[
+        (df['underlying'].str.upper() == underlying.upper()) &
+        (df['expiry_dt'] == extracted_expiry_dt)
+    ]
+
+    calls = chain_contracts[chain_contracts['option_type'] == 'CE']
+    puts = chain_contracts[chain_contracts['option_type'] == 'PE']
+
+    option_chain = pd.merge(
+        calls[['strike', 'ltp', 'oi', 'iv']].rename(columns={'ltp': 'CE_LTP', 'oi': 'CE_OI', 'iv': 'CE_IV'}),
+        puts[['strike', 'ltp', 'oi', 'iv']].rename(columns={'ltp': 'PE_LTP', 'oi': 'PE_OI', 'iv': 'PE_IV'}),
+        on='strike',
+        how='outer'
+    ).sort_values('strike').reset_index(drop=True)
+
+    return extracted_expiry_str, option_chain
+
 def process_historical_contracts_payload(payload: dict) -> dict:
-    """
-    Processes historical contract datasets/JSON payload to determine limit expiries,
-    handle roll-overs and contract expirations, and return the filtered option chain matrix.
-    No weekday math is used! All expiries come strictly from historical contract metadata.
-    """
     underlying = payload.get("underlying", "NIFTY").upper()
     req_date_raw = payload.get("request_date")
     if not req_date_raw:
@@ -122,7 +181,6 @@ def process_historical_contracts_payload(payload: dict) -> dict:
 
     contracts = payload.get("historical_contracts", [])
     if not contracts:
-        # If no contracts provided, return fallback structure with request date
         return {
             "status": "SUCCESS",
             "underlying": underlying,
@@ -132,7 +190,6 @@ def process_historical_contracts_payload(payload: dict) -> dict:
             "option_chain": []
         }
 
-    # Step 1 & 2: Parse contract expiries directly from historical contract metadata fields
     parsed_contracts = []
     contract_expiries = set()
 
@@ -165,8 +222,6 @@ def process_historical_contracts_payload(payload: dict) -> dict:
         parsed_contracts.append(parsed_c)
 
     sorted_expiries = sorted(list(contract_expiries))
-
-    # Determine target limit expiry date
     future_or_current_expiries = [e for e in sorted_expiries if e >= req_date]
 
     if future_or_current_expiries:
@@ -183,10 +238,6 @@ def process_historical_contracts_payload(payload: dict) -> dict:
             is_historical = False
             warning = f"Out-of-Range Request: {req_date} falls outside historical contract availability window."
 
-    if sorted_expiries and req_date < min(sorted_expiries) - timedelta(days=365):
-        warning = f"Out-of-Range Request: Requested date {req_date} is prior to historical contract availability window."
-
-    # Step 3: Option Chain Filtering & Grouping
     matching_contracts = [c for c in parsed_contracts if c["normalized_expiry"] == target_limit_expiry and c.get("strike") is not None]
 
     strikes_map = {}
@@ -242,14 +293,15 @@ def process_historical_contracts_payload(payload: dict) -> dict:
     return response
 
 def generate_mock_symbols_for_demo(underlying: str, atm_strike: float, step: float, replay_date: date) -> list:
-    """
-    Generates mock contracts directly using relative day offsets from replay_date,
-    without any Thursday or weekday math.
-    """
     underlying_upper = underlying.upper().strip()
 
-    # Generate 4 expiries relative to replay_date
-    exp_dates = [replay_date + timedelta(days=7 * i) for i in range(4)]
+    start_date = replay_date
+    if start_date.weekday() == 5:
+        start_date += timedelta(days=2)
+    elif start_date.weekday() == 6:
+        start_date += timedelta(days=1)
+
+    exp_dates = [start_date + timedelta(days=7 * i) for i in range(4)]
     strikes = [round(atm_strike + (i - 10) * step, 2) for i in range(21)]
     symbols = []
 
@@ -265,22 +317,18 @@ def generate_mock_symbols_for_demo(underlying: str, atm_strike: float, step: flo
         for strike in strikes:
             strike_str = str(int(strike))
             for right in ["CE", "PE"]:
-                sym_weekly = f"{underlying_upper}{yy}{month_code}{day_str}{strike_str}{right}"
-                symbols.append(sym_weekly)
-                if is_monthly:
+                if not is_monthly:
+                    sym_weekly = f"{underlying_upper}{yy}{month_code}{day_str}{strike_str}{right}"
+                    symbols.append(sym_weekly)
+                else:
                     month_str = MONTHLY_MAP_REV.get(month_val, "AUG")
                     sym_monthly = f"{underlying_upper}{yy}{month_str}{strike_str}{right}"
                     symbols.append(sym_monthly)
     return symbols
 
 def get_dynamic_expiry_dates(symbol: str, atm_strike: float, step: float, replay_date: date, client=None, historical_contracts=None) -> list:
-    """
-    Extracts available expiry dates directly from historical contract metadata, quotes, or symbol parsing.
-    Completely free of weekday math or Thursday calculations!
-    """
     exp_dates = set()
 
-    # Step A: Extract directly from historical_contracts metadata if provided
     if historical_contracts:
         for c in historical_contracts:
             raw_exp = None
@@ -294,7 +342,6 @@ def get_dynamic_expiry_dates(symbol: str, atm_strike: float, step: float, replay
                 except Exception:
                     pass
 
-    # Step B: Extract directly from Breeze client option chain quotes metadata
     if client and client.configured and client.session_token:
         try:
             quotes = client.get_option_chain_quotes(symbol.upper().strip())
@@ -306,7 +353,6 @@ def get_dynamic_expiry_dates(symbol: str, atm_strike: float, step: float, replay
                             exp_dates.add(normalize_date(raw_exp))
                         except Exception:
                             pass
-                    # Also check symbols
                     for key in ["symbol", "symbol_name", "contract_name", "symbol_code", "contract_detail"]:
                         val = q.get(key)
                         if val and len(val) > 10:
@@ -317,7 +363,6 @@ def get_dynamic_expiry_dates(symbol: str, atm_strike: float, step: float, replay
         except Exception:
             pass
 
-    # Step C: If no dates extracted yet, parse from generated mock symbols
     if not exp_dates:
         symbols = generate_mock_symbols_for_demo(symbol, atm_strike, step, replay_date)
         for s in symbols:
